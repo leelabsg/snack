@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snack-graph"
+dynamic = ["version"]
+description = "SNACK: A Sequential Notation Framework for Probabilistic Graph Generation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0 AND MIT"
+license-files = ["LICENSE", "LICENSE-SPECTRE.txt"]
+authors = [
+    {name = "Hohyun Kim"},
+    {name = "Hyesung Kim"},
+    {name = "Min-hwan Oh"},
+    {name = "Seunggeun Lee"},
+]
+dependencies = ["networkx", "pynauty", "rdkit"]
+keywords = ["graph", "string-representation", "molecule", "snack"]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Homepage = "https://github.com/leelabsg/snack"
+Repository = "https://github.com/leelabsg/snack"
+Issues = "https://github.com/leelabsg/snack/issues"
+
+[tool.setuptools]
+packages = ["snack"]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "snack.__version__"}
+
+[tool.setuptools.package-data]
+snack = ["data/*.csv", "data/README.md"]

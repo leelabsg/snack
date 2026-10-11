@@ -19,13 +19,18 @@ utilities to convert between:
 Dependencies: `networkx`, `pynauty`, and `rdkit`. The tokenizer and dataset
 loader do not require PyTorch or pandas.
 
-## Local installation
+## Installation
 
-Requires Python 3.10 or newer. Replace `<repository-url>` with this repository's
-HTTPS clone URL from GitHub:
+Requires Python 3.10 or newer. After the first PyPI release:
 
 ```bash
-git clone <repository-url> snack
+python -m pip install snack-graph
+```
+
+### Install from source
+
+```bash
+git clone https://github.com/leelabsg/snack.git
 cd snack
 python -m pip install .
 ```

@@ -1,0 +1,110 @@
+name: Build, test, and publish
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Check only, or publish to the selected package index"
+        required: true
+        default: check
+        type: choice
+        options:
+          - check
+          - testpypi
+          - pypi
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install build tools
+        run: python -m pip install build twine
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Validate metadata and bundled files
+        run: |
+          python -m twine check --strict dist/*
+          python tests/check_distribution.py dist/*
+      - name: Require a matching version tag for PyPI
+        if: inputs.target == 'pypi'
+        env:
+          RELEASE_REF: ${{ github.ref }}
+        run: |
+          python - <<'PY'
+          from email.parser import BytesParser
+          from pathlib import Path
+          import os
+          import zipfile
+
+          wheel, = Path('dist').glob('*.whl')
+          with zipfile.ZipFile(wheel) as archive:
+              name, = [n for n in archive.namelist() if n.endswith('.dist-info/METADATA')]
+              metadata = BytesParser().parsebytes(archive.read(name))
+          expected = 'refs/tags/v' + metadata['Version']
+          if os.environ['RELEASE_REF'] != expected:
+              raise SystemExit(f'For PyPI, run this workflow on {expected}.')
+          PY
+      - uses: actions/upload-artifact@v5
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/download-artifact@v6
+        with:
+          name: distributions
+          path: dist/
+      - name: Install the built wheel
+        run: |
+          python -m pip install dist/*.whl
+          python -m pip check
+      - name: Test the installed package outside the source directory
+        run: |
+          cp -r tests "$RUNNER_TEMP/snack-tests"
+          cd "$RUNNER_TEMP"
+          python -m unittest discover -s snack-tests -p 'test*.py' -v
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.target != 'check'
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.target }}
+      url: ${{ inputs.target == 'pypi' && 'https://pypi.org/p/snack-graph' || 'https://test.pypi.org/p/snack-graph' }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: distributions
+          path: dist/
+      - name: Publish using Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ inputs.target == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
