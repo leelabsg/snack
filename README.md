@@ -1,8 +1,8 @@
-# SNACK (Sequential Notation of Adjacent Connectivity FrameworK)
+# SNACK
 
 **SNACK: A Sequential Notation Framework for Probabilistic Graph Generation**
 
-*Hohyun Kim, Hyesung Kim, Min-hwan Oh, Seunggeun Lee*
+Hohyun Kim*, Hyesung Kim*, Min-hwan Oh, Seunggeun Lee
 
 ---
 
@@ -21,7 +21,7 @@ loader do not require PyTorch or pandas.
 
 ## Installation
 
-Requires Python 3.10 or newer. After the first PyPI release:
+### Intall using `pip`
 
 ```bash
 python -m pip install snack-graph
