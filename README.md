@@ -1,8 +1,13 @@
 # SNACK
 
-**SNACK: A Sequential Notation Framework for Probabilistic Graph Generation**
+> **SNACK: A Sequential Notation Framework for Probabilistic Graph Generation**
 
-Hohyun Kim*, Hyesung Kim*, Min-hwan Oh, Seunggeun Lee
+Hohyun Kim\* &nbsp;|&nbsp; Hyesung Kim\* &nbsp;|&nbsp; Min-hwan Oh &nbsp;|&nbsp; Seunggeun Lee
+
+Neural Information Processing Systems (NeurIPS), 2026
+
+[![ArXiv](https://img.shields.io/badge/arXiv-2610.19781-b31b1b.svg)](https://arxiv.org/abs/2610.19781)
+[![Paper](https://img.shields.io/badge/Paper-PDF-red.svg)](https://arxiv.org/pdf/2610.19781)
 
 ---
 
@@ -10,7 +15,7 @@ Hohyun Kim*, Hyesung Kim*, Min-hwan Oh, Seunggeun Lee
    <img src="image/snack_fig.png" alt="SNACK encoding process" width="650px">
 </p>
 
-`snack` is a compact string representation for (attributed) graphs, with helper
+`snack` is a compact string representation for discrete graphs, with helper
 utilities to convert between:
 
 - **NetworkX graphs** ↔ **SNACK strings**
@@ -21,56 +26,36 @@ loader do not require PyTorch or pandas.
 
 ## Installation
 
-### Intall using `pip`
-
 ```bash
-python -m pip install snack-graph
+pip install snack-graph
 ```
 
-### Install from source
+## Usage
 
-```bash
-git clone https://github.com/leelabsg/snack.git
-cd snack
-python -m pip install .
-```
+| Function | Purpose |
+| --- | --- |
+| `graph_to_snack()` / `snack_to_graph()` | Convert between NetworkX graphs and SNACK strings. |
+| `smiles_to_snack()` / `snack_to_smiles()` | Convert between SMILES and SNACK strings. |
+| `mol_to_snack()` / `snack_to_mol()` | Convert between RDKit molecules and SNACK strings. |
+| `smiles_to_graph()` / `graph_to_smiles()` | Convert between SMILES and NetworkX graphs. |
+| `mol_to_graph()` / `graph_to_mol()` | Convert between RDKit molecules and NetworkX graphs. |
+| `graph_to_tokens()` / `tokens_to_graph()` | Convert between NetworkX graphs and lists of SNACK tokens. |
+| `split()` | Split a SNACK string into tokens, distance–edge pairs, or node blocks. |
+| `filter()` | Extract node types, edge types, or distances from a SNACK string. |
+| `SnackTokenizer()` | Create a tokenizer using the `graph`, `zinc250k`, `moses`, or `guacamol` preset. |
+| `tokenizer.encode()` / `tokenizer.decode()` | Convert between SNACK strings and integer token IDs. |
+| `tokenizer.get_logit_mask()` | Return an allowed-next-token mask after each token in a sequence. |
+| `load_dataset()` | Load a bundled dataset as a dictionary of `train`, `val`, and `test` SNACK-string lists. |
+| `count_automorphisms()` | Count graph symmetries while respecting node types, edge types, and weights. |
+| `canonicalize_smiles()` / `randomize_smiles()` | Produce canonical SMILES or an alternative SMILES for the same molecule. |
 
-If you downloaded a ZIP, extract it and run `python -m pip install .` inside the
-extracted repository. Use the directory containing `pyproject.toml`, which is
-the repository root; the inner `snack/` directory contains the Python code.
 
 
 ## Examples
 
-### 1) SMILES → SNACK → SMILES (round-trip)
+### 1) NetworkX graph → SNACK → graph
 
-`smiles_to_snack()` uses randomized BFS by default. Set a random seed for
-reproducible sequences, or use `ordering=None` to preserve input atom order.
-
-```python
-import random
-import snack as snk
-
-random.seed(0)
-smiles = "CCO"  # ethanol
-sn = snk.smiles_to_snack(smiles, ordering="bfs")
-smiles_rt = snk.snack_to_smiles(sn, canonical=True)
-
-print("snack:", sn)
-print("canonical smiles:", smiles_rt)
-```
-
-```text
-snack: [C]1-[O]2-[C]
-canonical smiles: CCO
-```
-
-### 2) NetworkX graph → SNACK → graph
-
-Use bracketed `node_type` labels and raw `edge_type` strings. Graphs may use
-arbitrary node IDs; decoding assigns consecutive integer IDs in sequence order.
-Input graphs are not modified. Directed graphs, multigraphs, and self-loops
-are unsupported.
+SNACK specifies node types in brackets (e.g., [node_type]).
 
 ```python
 import random
@@ -99,11 +84,9 @@ print(G2.edges(data=True))
 [(0, 2, {'edge_type': '-'}), (1, 2, {'edge_type': '='})]
 ```
 
-### 3) Non-attributed graphs
+### 2) Non-attributed graphs
 
-`v` denotes a node. Each distance counts positions backward to an earlier node;
-`_` denotes an untyped edge. The default layout puts backward edges before
-the current node, in descending distance order.
+`v` denotes a node. `_` denotes an untyped edge (used to separate consecutive distances).
 
 ```python
 import networkx as nx
@@ -127,23 +110,23 @@ v1_v2_v1_v2_v
 ['v', '1_', 'v', '2_', 'v', '1_', 'v', '2_', 'v']
 ```
 
-### 4) Weighted graphs and complex edge types
 
-Complex edge types use parentheses. Only `node_type`, `edge_type`, and finite
-numeric `weight` attributes are serialized. Use `attributed=False` to retain
-only connectivity. Graph labels are preserved literally under node reordering.
+### 3) Weighted graphs and complex edge types
+
+Complex edge types use parentheses. Use `attributed=False` to retain
+only connectivity.
 
 ```python
 import networkx as nx
 import snack as snk
 
 G = nx.Graph()
-G.add_edge("left", "right", weight=3)
+G.add_edge(0, 1, weight=3)
 sn = snk.graph_to_snack(G)
 print("weighted:", sn)
 print("decoded edge:", snk.snack_to_graph(sn).edges[0, 1])
 
-G.edges["left", "right"]["edge_type"] = "contact"
+G.edges[0, 1]["edge_type"] = "contact"
 print("type and weight:", snk.graph_to_snack(G))
 print("connectivity only:", snk.graph_to_snack(G, attributed=False))
 ```
@@ -153,6 +136,29 @@ weighted: v1(weight=3)v
 decoded edge: {'weight': 3}
 type and weight: v1(type=contact;weight=3)v
 connectivity only: v1_v
+```
+
+### 4) SMILES → SNACK → SMILES (round-trip)
+
+`smiles_to_snack()` uses randomized BFS by default. Set a random seed for
+reproducible sequences, or use `ordering=None` to preserve input atom order.
+
+```python
+import random
+import snack as snk
+
+random.seed(0)
+smiles = "CCO"  # ethanol
+sn = snk.smiles_to_snack(smiles, ordering="bfs")
+smiles_rt = snk.snack_to_smiles(sn, canonical=True)
+
+print("snack:", sn)
+print("canonical smiles:", smiles_rt)
+```
+
+```text
+snack: [C]1-[O]2-[C]
+canonical smiles: CCO
 ```
 
 ### 5) RDKit molecule ↔ NetworkX graph ↔ SNACK
