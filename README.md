@@ -183,8 +183,9 @@ from snack: CCO
 ```
 
 `smiles_to_graph()` accepts SMILES directly; `graph_to_mol()` returns an RDKit
-molecule. Molecular conversion preserves isotopes and atom maps but omits all
-stereochemistry. Dative bonds, invalid valence, and unsupported molecular tokens
+molecule. Molecular conversion preserves isotopes and atom maps. It omits
+stereochemistry unless `stereo=True` is passed (see example 18). Dative bonds,
+invalid valence, and unsupported molecular tokens
 raise `ValueError`. Connectivity-only graphs cannot be decoded as molecules.
 
 ### 6) Hydrogen counts and molecular conversion options
@@ -209,7 +210,9 @@ without H counts: [C] -> C
 ```
 
 Hydrogen counts are omitted by default; separate hydrogen nodes remain in the
-graph. `use_charge=True` preserves formal charges, and `kekulize=True` expresses
+graph. `use_hydrogens="auto"` writes a count only where it differs from the
+inferred one (radicals such as `[CH3]`), so ordinary molecules keep their
+default spelling. `use_charge=True` preserves formal charges, and `kekulize=True` expresses
 aromatic bonds using single and double bonds. Omitting hydrogen counts or
 charges can change molecular identity or prevent decoding.
 
@@ -490,50 +493,48 @@ Each split is a list of SNACK strings. Supported names are `community_small`,
 `ego`, `ego_small`, `enzymes`, `grid`, `grid_small`, `lobster`, `planar`, and `sbm`. 
 See [dataset details](snack/data/README.md) for details. 
 
+### 18) Stereochemistry and radicals
+
+`stereo=True` keeps tetrahedral centers (`{@}`, `{@@}` after a node) and
+double-bond cis/trans (`{c}`, `{t}` after `=`). A missing annotation means
+"unspecified". `use_hydrogens="auto"` writes an H count only where it differs
+from the inferred one, so radicals survive.
+
+```python
+import snack as snk
+
+for smiles in ["C[C@H](N)C(=O)O", "F/C=C/F", "[CH2]C"]:
+    sn = snk.smiles_to_snack(smiles, ordering=None, stereo=True, use_hydrogens="auto")
+    print(f"{smiles:16} {sn:32} {snk.snack_to_smiles(sn)}")
+```
+
+```text
+C[C@H](N)C(=O)O  [C]1-[C]{@}1-[N]2-[C]1=[O]2-[O]  C[C@H](N)C(=O)O
+F/C=C/F          [F]1-[C]1={t}[C]1-[F]            F/C=C/F
+[CH2]C           [CH2]1-[C]                       [CH2]C
+```
+
+Annotations are relative to the node order and recomputed for every order:
+
+- `{@}`/`{@@}` have the SMILES meaning, with neighbors listed by increasing
+  node index. An implicit H or lone pair takes the center's own position.
+- `{c}`/`{t}` tell whether the smallest-index neighbors at the two ends of the
+  double bond are on the same or opposite side (local cis/trans, not CIP E/Z).
+
+Graphs store order-independent attributes, node `tetra` and edge
+`cis_trans`, so any `ordering` stays correct. RDKit decides which atoms and
+bonds are stereogenic. Decoding drops annotations that are not
+(`stereo="strict"` raises instead), and `is_canonical_snack()` checks that
+every annotation and H count is necessary. `count_automorphisms(G,
+stereo=True)` respects stereo, e.g. 1 instead of 2 for meso 2,3-butanediol.
+
+`SnackTokenizer(preset, stereo=True)` appends `{@} {@@} {c} {t}` to the
+vocabulary without changing existing token IDs. Generated outputs always
+decode but may carry unnecessary annotations; filter them with
+`is_canonical_snack()`. `hydrogens="auto"` allows generating H-count atoms.
+
 ## Not supported
 
-- **Atom chirality:** `@`/`@@` and R/S configurations are not encoded or restored.
-- **Bond stereochemistry:** Cis/trans and E/Z information is omitted. Stereo
-  double bonds become ordinary `=` bonds, so stereoisomers can share the same
-  SNACK representation.
-- **Explicit radical states:** Radical-electron counts are not serialized.
-  With `use_hydrogens=True`, RDKit can infer radical states from hydrogen counts,
-  charges, and bonds. Without these counts, radical information may be lost;
-  for example, `[CH3]` becomes `[C]` and decodes as methane.
-
-### Radical example
-
-Hydrogen counts preserve the radical in this example; the default conversion
-loses it.
-
-```python
-import snack as snk
-
-smiles = "[CH2]c1c[nH]c2ccccc12"
-sn = snk.smiles_to_snack(smiles, ordering=None)
-sn_h = snk.smiles_to_snack(smiles, ordering=None, use_hydrogens=True)
-
-print("default:", snk.snack_to_smiles(sn))
-print("with H counts:", snk.snack_to_smiles(sn_h))
-```
-
-```text
-default: Cc1c[nH]c2ccccc12
-with H counts: [CH2]c1c[nH]c2ccccc12
-```
-
-### Chirality example
-
-Atom chirality is lost even when hydrogen counts are preserved.
-
-```python
-import snack as snk
-
-smiles = "N[C@@H](C)C(=O)O"
-sn = snk.smiles_to_snack(smiles, ordering=None, use_hydrogens=True)
-print("decoded:", snk.snack_to_smiles(sn))
-```
-
-```text
-decoded: CC(N)C(=O)O
-```
+- Axial chirality (allenes, atropisomers), square-planar/octahedral metal
+  centers, enhanced stereo groups (and/or), and unknown ("wavy") stereo.
+- 3D coordinates, conformers, and tautomers.

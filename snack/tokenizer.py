@@ -1,7 +1,8 @@
 """Small SNACK tokenizer and next-token masks; no torch/numpy/pandas imports.
 
 Masks are vocabulary/logit masks (True = allowed), not transformer attention
-matrices. Molecular presets model simple, kekulized, non-stereochemical graphs.
+matrices. Molecular presets model simple, kekulized graphs; stereo=True adds
+the optional {@} {@@} {c} {t} annotations.
 """
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -46,6 +47,11 @@ _MAX_NODES = {'graph': 128, 'zinc250k': 38, 'moses': 27, 'guacamol': 88}
 _BOND_ORDERS = {'-': 1, '=': 2, '#': 3}
 
 
+def _explicit_hydrogens(token):
+    from snack.mol import string_to_atom
+    return string_to_atom(token).GetNumExplicitHs()
+
+
 @lru_cache(maxsize=None)
 def _atom_spec(token, preset):
     """(maximum bond-order sum, allowed completed sums) for a basic atom."""
@@ -69,15 +75,18 @@ def _atom_spec(token, preset):
     return max(allowed), allowed
 
 
-def basic_vocabulary(preset='graph', max_nodes=None, max_distance=None):
+def basic_vocabulary(preset='graph', max_nodes=None, max_distance=None, *, stereo=False):
     """Return stable tokens, including [pad], [bos], [eos], for a preset.
 
     Molecular presets include explicit H variants for use_hydrogens=True
     output. Complex edge labels require a custom vocabulary and valence=False;
-    no chemistry guarantee applies then.
+    no chemistry guarantee applies then. stereo=True appends {@} {@@} {c} {t}
+    after all other tokens, so existing token IDs are unchanged.
     """
     if preset not in _MAX_NODES:
         raise ValueError('preset must be graph, zinc250k, moses, or guacamol')
+    if stereo and preset == 'graph':
+        raise ValueError('Stereo annotations require a molecular preset')
     maximum = _MAX_NODES[preset] if max_nodes is None else max_nodes
     if not isinstance(maximum, Integral) or isinstance(maximum, bool) or maximum < 1:
         raise ValueError('max_nodes must be a positive integer')
@@ -93,7 +102,9 @@ def basic_vocabulary(preset='graph', max_nodes=None, max_distance=None):
             for h in range(capacity + 1):
                 atoms.append(f'[{match["element"]}H{h if h != 1 else ""}{match["charge"] or ""}]')
     distances = [f'{i}_' if preset == 'graph' else str(i) for i in range(1, distance + 1)]
-    return ['[pad]', '[bos]', '[eos]'] + atoms + distances + ([] if preset == 'graph' else list(_BOND_ORDERS))
+    return (['[pad]', '[bos]', '[eos]'] + atoms + distances
+            + ([] if preset == 'graph' else list(_BOND_ORDERS))
+            + (list(_graph.STEREO_TOKENS) if stereo else []))
 
 
 @dataclass
@@ -107,6 +118,8 @@ class _State:
     pending: int | None = None
     last_distance: int | None = None
     bfs_floor: int = 0
+    degree: list = field(default_factory=list)
+    last: tuple | None = None
 
 
 class SnackTokenizer:
@@ -124,15 +137,24 @@ class SnackTokenizer:
 
     Preset valence masks default to implicit-H atom types. Explicit-H variants
     stay in the vocabulary for encoding; opt into generating them via
-    allowed_node_types. Custom restrictions can lead to an empty mask:
-    backtrack or restart rather than emitting an invalid EOS. Every permitted
-    molecular EOS passes RDKit sanitization, which also infers radical counts.
+    allowed_node_types or hydrogens='auto'. Custom restrictions can lead to an
+    empty mask: backtrack or restart rather than emitting an invalid EOS.
+    Every permitted molecular EOS passes RDKit sanitization, which also infers
+    radical counts.
+
+    ``stereo=True`` appends {@} {@@} {c} {t}; outputs may carry unnecessary
+    annotations (see snack.is_canonical_snack). ``hydrogens='auto'`` allows
+    generating H variants.
     """
     def __init__(self, preset='graph', *, max_nodes=None, max_distance=None,
                  ordering=None, allow_disconnected=False, node_first=None, ascending=None,
                  valence=None, node_types=None, edge_types=None,
-                 allowed_node_types=None, allowed_edge_types=None):
-        base = basic_vocabulary(preset, max_nodes, max_distance)
+                 allowed_node_types=None, allowed_edge_types=None,
+                 stereo=False, hydrogens=None):
+        base = basic_vocabulary(preset, max_nodes, max_distance, stereo=stereo)
+        if hydrogens not in (None, 'auto'):
+            raise ValueError("hydrogens must be None or 'auto'")
+        self.stereo = bool(stereo)
         self.preset = preset
         self.max_nodes = _MAX_NODES[preset] if max_nodes is None else int(max_nodes)
         self.max_distance = self.max_nodes - 1 if max_distance is None else int(max_distance)
@@ -157,14 +179,16 @@ class SnackTokenizer:
         if (not self.molecular and self.edge_types) or (self.molecular and not self.edge_types):
             raise ValueError('Graph mode uses untyped edges; molecular mode requires edge types')
         distances = [token for token in base if _graph.token_type(token) == 'distance']
-        self.tokens = tuple(base[:3]) + self.node_types + tuple(distances) + self.edge_types
+        self.stereo_types = tuple(_graph.STEREO_TOKENS) if self.stereo else ()
+        self.tokens = (tuple(base[:3]) + self.node_types + tuple(distances) + self.edge_types
+                       + self.stereo_types)
         if len(set(self.tokens)) != len(self.tokens):
             raise ValueError('Vocabulary must not contain duplicate or reserved tokens')
         self.token_to_id = {token: i for i, token in enumerate(self.tokens)}
         self.pad_id, self.bos_id, self.eos_id = range(3)
         # Default generation uses implicit-H atoms. H variants remain in the
         # vocabulary for encoding; opt into their generation via allowed_node_types.
-        if allowed_node_types is None and node_types is None and self.valence:
+        if allowed_node_types is None and node_types is None and self.valence and hydrogens is None:
             allowed_node_types = _BASE_ATOMS[preset]
         self._nodes = self._restrict(self.node_types, allowed_node_types, 'node')
         self._edges = self._restrict(self.edge_types, allowed_edge_types, 'edge')
@@ -174,6 +198,13 @@ class SnackTokenizer:
         self._node_ids = [self.token_to_id[token] for token in self._nodes]
         self._edge_ids = [self.token_to_id[token] for token in self._edges]
         self._distance_ids = [self.token_to_id[token] for token in distances]
+        self._tetra_ids = [self.token_to_id[token] for token in self.stereo_types
+                           if token in _graph.NODE_STEREO_TOKENS]
+        self._cis_trans_ids = [self.token_to_id[token] for token in self.stereo_types
+                               if token in _graph.EDGE_STEREO_TOKENS]
+        # Nodes that can carry {@}/{@@}: room for three or more ligands (bonds plus H).
+        self._tetra_nodes = frozenset(token for token in self.node_types if not self.valence or (
+            token in self._specs and self._specs[token][0] + _explicit_hydrogens(token) >= 3))
 
     @staticmethod
     def _restrict(vocabulary, allowed, kind):
@@ -332,7 +363,17 @@ class SnackTokenizer:
     def _copy(state):
         return _State(state.started, state.ended, state.nodes[:], state.used[:],
                       state.edges[:], dict(state.block), state.pending,
-                      state.last_distance, state.bfs_floor)
+                      state.last_distance, state.bfs_floor, state.degree[:], state.last)
+
+    def _stereo_ids(self, state):
+        # An annotation must directly follow the node or edge just completed (state.last).
+        if state.last is None:
+            return []
+        kind, key = state.last
+        if kind == 'node':
+            return self._tetra_ids if (state.nodes[key] in self._tetra_nodes
+                                       and state.degree[key] <= 4) else []
+        return self._cis_trans_ids if state.block.get(key[1]) == '=' else []
 
     def allowed_token_ids(self, state):
         """Allowed IDs for an incremental state. An empty result is a dead end.
@@ -350,6 +391,8 @@ class SnackTokenizer:
         allowed = [index for index in self._node_ids if self._node_ok(state, self.tokens[index])]
         allowed += [index for index in self._distance_ids
                     if self._distance_ok(state, int(self.tokens[index].rstrip('_')))]
+        if self.stereo:
+            allowed += self._stereo_ids(state)
         if self._can_end(state):
             allowed.append(self.eos_id)
         return allowed
@@ -358,6 +401,10 @@ class SnackTokenizer:
         current = self._current(state)
         state.edges.append((current, target, edge))
         state.block[target] = edge
+        state.degree[target] += 1
+        if self.node_first:
+            state.degree[current] += 1
+        state.last = ('edge', (current, target))
         if self.valence:
             order = _BOND_ORDERS[edge]
             state.used[target] += order
@@ -366,11 +413,12 @@ class SnackTokenizer:
 
     def _consume(self, state, index):
         token = self.tokens[index]
+        state.last = None
         if index == self.bos_id:
             state.started = True
         elif index == self.eos_id:
             state.ended = True
-        elif index == self.pad_id:
+        elif index == self.pad_id or token in self.stereo_types:
             pass
         elif token in self.node_types:
             if self.node_first:
@@ -378,12 +426,16 @@ class SnackTokenizer:
                     self._finish_block(state)
                 state.nodes.append(token)
                 state.used.append(0)
+                state.degree.append(0)
             else:
                 used = sum(_BOND_ORDERS[e] for e in state.block.values()) if self.valence else 0
+                degree = len(state.block)
                 # Finish while the new node's index is still len(nodes).
                 self._finish_block(state)
                 state.nodes.append(token)
                 state.used.append(used)
+                state.degree.append(degree)
+            state.last = ('node', len(state.nodes) - 1)
         elif token in self.edge_types:
             self._add_edge(state, state.pending, token)
             state.pending = None

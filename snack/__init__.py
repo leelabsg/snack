@@ -1,5 +1,5 @@
 # Sequential Notation of Adjacent Connectivity FrameworK (SNACK)
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from snack.dataset import load_dataset
 from snack.mol import (
@@ -15,6 +15,7 @@ from snack.mol import (
     mol_to_snack,
     canonicalize_smiles,
     randomize_smiles,
+    is_canonical_snack,
 )
 from snack.graph import (
     graph_to_tokens,

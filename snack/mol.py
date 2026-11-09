@@ -1,8 +1,10 @@
 import re
 import random
+from contextlib import contextmanager
 from rdkit import Chem
 import networkx as nx
-from snack.graph import graph_to_snack, snack_to_graph, _validate_graph
+from snack.graph import (graph_to_snack, snack_to_graph, _validate_graph, perm_parity,
+                         _check_tetra, _check_cis_trans, _FLIP)
 
 
 SINGLE_SYMBOL = '-'
@@ -143,29 +145,116 @@ def mol_to_smiles(mol, canonical=True):
     return Chem.MolToSmiles(mol, canonical=canonical)
 
 
-def mol_to_graph(mol, use_hydrogens=False, use_charge=True):
-    """Convert to an undirected typed graph, omitting all stereochemistry.
+_TAG_SIGNS = {Chem.ChiralType.CHI_TETRAHEDRAL_CCW: '@', Chem.ChiralType.CHI_TETRAHEDRAL_CW: '@@'}
+_BOND_DESCRIPTORS = {Chem.StereoDescriptor.Bond_Cis: 'c', Chem.StereoDescriptor.Bond_Trans: 't'}
+_CHIRAL_TAGS = {'@': Chem.ChiralType.CHI_TETRAHEDRAL_CCW, '@@': Chem.ChiralType.CHI_TETRAHEDRAL_CW}
+_BOND_STEREO = {'c': Chem.BondStereo.STEREOCIS, 't': Chem.BondStereo.STEREOTRANS}
 
-    Directional bond types, including dative bonds, are unsupported.
+
+@contextmanager
+def _stereo_perception():
+    """Pin RDKit's modern stereo perception, restoring the caller's setting."""
+    legacy = Chem.GetUseLegacyStereoPerception()
+    Chem.SetUseLegacyStereoPerception(False)
+    try:
+        yield
+    finally:
+        Chem.SetUseLegacyStereoPerception(legacy)
+
+
+def _specified_stereo(mol):
+    """({atom: (ligands, sign)}, {bond: (ref_begin, ref_end, mark)}) for specified stereo."""
+    # Judge on the aromatic form so the verdict does not depend on the Kekule structure.
+    perceived = Chem.Mol(mol)
+    try:
+        Chem.SanitizeMol(perceived)
+    except (RuntimeError, ValueError):
+        perceived = Chem.Mol(mol)
+    with _stereo_perception():
+        infos = Chem.FindPotentialStereo(perceived, cleanIt=True)
+    num_atoms = mol.GetNumAtoms()
+    atoms, bonds = {}, {}
+    for info in infos:
+        if info.specified != Chem.StereoSpecified.Specified:
+            continue
+        # Missing ligands come back as an out-of-range index.
+        controlling = [a if a < num_atoms else None for a in info.controllingAtoms]
+        if info.type == Chem.StereoType.Atom_Tetrahedral:
+            # The FindPotentialStereo descriptor can disagree with the tag on ring atoms.
+            atom = mol.GetAtomWithIdx(info.centeredOn)
+            sign = _TAG_SIGNS.get(atom.GetChiralTag())
+            ligands = [bond.GetOtherAtomIdx(atom.GetIdx()) for bond in atom.GetBonds()]
+            if sign is not None and len(ligands) in (3, 4):
+                atoms[atom.GetIdx()] = (tuple(ligands + [None] * (4 - len(ligands))), sign)
+        elif info.type == Chem.StereoType.Bond_Double and info.descriptor in _BOND_DESCRIPTORS:
+            bond = mol.GetBondWithIdx(info.centeredOn)
+            # Two slots per end; the descriptor compares slot 0 with slot 2.
+            ref_a, ref_b = controlling[0], controlling[2]
+            if mol.GetBondBetweenAtoms(bond.GetBeginAtomIdx(), ref_a) is None:
+                ref_a, ref_b = ref_b, ref_a
+            bonds[info.centeredOn] = (ref_a, ref_b, _BOND_DESCRIPTORS[info.descriptor])
+    return atoms, bonds
+
+
+def _default_hydrogens(node_types, bonds):
+    """Implicit H counts SNACK decoding infers for H-free versions of atoms."""
+    mol = Chem.RWMol()
+    for token in node_types:
+        atom = string_to_atom(token)
+        atom.SetNoImplicit(False)
+        atom.SetNumExplicitHs(0)
+        mol.AddAtom(atom)
+    for u, v, order in bonds:
+        mol.AddBond(u, v, order=order)
+    mol.UpdatePropertyCache(strict=False)
+    return [atom.GetNumImplicitHs() for atom in mol.GetAtoms()]
+
+
+def mol_to_graph(mol, use_hydrogens=False, use_charge=True, *, stereo=False):
+    """Convert to an undirected typed graph. Directional bond types are unsupported.
+
+    use_hydrogens='auto' writes H counts only where they differ from the
+    inferred count (e.g. radicals). stereo=True keeps 'tetra'/'cis_trans'.
     """
     if mol is None:
         raise ValueError('Expected an RDKit molecule, got None')
     graph = nx.Graph()
-    for atom in mol.GetAtoms():
-        token = atom_to_string(atom, use_hydrogens, use_charge)
-        graph.add_node(atom.GetIdx(), node_type=token)
+    bonds = []
     for bond in mol.GetBonds():
-        u, v = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
         try:
-            edge_type = BONDTYPE_TO_SYMBOL[bond.GetBondType()]
+            BONDTYPE_TO_SYMBOL[bond.GetBondType()]
         except KeyError as exc:
             raise ValueError(f'Unsupported bond type: {bond.GetBondType()}') from exc
-        graph.add_edge(u, v, edge_type=edge_type)
+        bonds.append((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), bond.GetBondType()))
+    if use_hydrogens == 'auto':
+        bare = [atom_to_string(atom, False, use_charge) for atom in mol.GetAtoms()]
+        defaults = _default_hydrogens(bare, bonds)
+        write_h = [atom.GetTotalNumHs() != default for atom, default in zip(mol.GetAtoms(), defaults)]
+    else:
+        write_h = [bool(use_hydrogens)] * mol.GetNumAtoms()
+    for atom in mol.GetAtoms():
+        token = atom_to_string(atom, write_h[atom.GetIdx()], use_charge)
+        graph.add_node(atom.GetIdx(), node_type=token)
+    for u, v, bond_type in bonds:
+        graph.add_edge(u, v, edge_type=BONDTYPE_TO_SYMBOL[bond_type])
+    if stereo:
+        atoms, double_bonds = _specified_stereo(mol)
+        for atom, value in atoms.items():
+            graph.nodes[atom]['tetra'] = value
+        for index, (ref_a, ref_b, mark) in double_bonds.items():
+            bond = mol.GetBondWithIdx(index)
+            u, v = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+            graph.edges[u, v]['cis_trans'] = ((u, ref_a), (v, ref_b), mark)
     return graph
 
 
-def graph_to_mol(graph):
-    """Build and sanitize a molecule, raising ValueError for invalid chemistry."""
+def graph_to_mol(graph, *, stereo='clean'):
+    """Build and sanitize a molecule, raising ValueError for invalid chemistry.
+
+    stereo='clean' drops annotations that are not stereo elements; 'strict' raises.
+    """
+    if stereo not in ('clean', 'strict'):
+        raise ValueError(f"stereo must be 'clean' or 'strict', got {stereo!r}")
     _validate_graph(graph)
     mol = Chem.RWMol()
     nodes = list(graph)
@@ -185,43 +274,119 @@ def graph_to_mol(graph):
                 raise ValueError(f'Unsupported molecular edge type: {edge_type!r}')
             mol.AddBond(rank[u], rank[v], order=SYMBOL_TO_BONDTYPE[edge_type])
         Chem.SanitizeMol(mol)
+        has_cis_trans = _apply_stereo(graph, mol, nodes, rank, stereo)
     except (RuntimeError, ValueError, OverflowError) as exc:
         raise ValueError(f'Invalid molecular graph: {exc}') from exc
-    return mol.GetMol()
+    return _normalize_bond_stereo(mol.GetMol()) if has_cis_trans else mol.GetMol()
 
 
-def smiles_to_graph(smiles, kekulize=True, use_hydrogens=False, use_charge=True):
-    return mol_to_graph(smiles_to_mol(smiles, kekulize), use_hydrogens, use_charge)
+def _normalize_bond_stereo(mol):
+    """Reparse through SMILES, keeping atom order, so cis/trans gives canonical SMILES."""
+    smiles = Chem.MolToSmiles(mol)
+    order = [int(i) for i in mol.GetProp('_smilesAtomOutputOrder').strip('[]').split(',') if i]
+    parsed = Chem.MolFromSmiles(smiles)
+    if parsed is None or parsed.GetNumAtoms() != mol.GetNumAtoms() or len(order) != len(set(order)):
+        return mol
+    # order[i] is the original atom written i-th; invert it to restore the original order.
+    inverse = [0] * len(order)
+    for position, atom in enumerate(order):
+        inverse[atom] = position
+    return Chem.RenumberAtoms(parsed, inverse)
 
 
-def graph_to_smiles(graph, canonical=True):
-    return mol_to_smiles(graph_to_mol(graph), canonical)
+def _apply_stereo(graph, mol, nodes, rank, mode):
+    tetra = {node: _check_tetra(graph, node) for node, data in graph.nodes(data=True) if 'tetra' in data}
+    cis_trans = {(u, v): _check_cis_trans(graph, u, v)
+                 for u, v, data in graph.edges(data=True) if 'cis_trans' in data}
+    if not tetra and not cis_trans:
+        return False
+    for node, (ligands, sign) in tetra.items():
+        atom = mol.GetAtomWithIdx(rank[node])
+        # RDKit tags refer to bond order, with an implicit ligand last.
+        order = [nodes[bond.GetOtherAtomIdx(rank[node])] for bond in atom.GetBonds()]
+        order += [None] * (4 - len(order))
+        atom.SetChiralTag(_CHIRAL_TAGS[sign if perm_parity(ligands, order) == 1 else _FLIP[sign]])
+    requested_bonds = set()
+    for (u, v), (refs, mark) in cis_trans.items():
+        bond = mol.GetBondBetweenAtoms(rank[u], rank[v])
+        begin, end = nodes[bond.GetBeginAtomIdx()], nodes[bond.GetEndAtomIdx()]
+        bond.SetStereoAtoms(rank[refs[begin]], rank[refs[end]])
+        bond.SetStereo(_BOND_STEREO[mark])
+        requested_bonds.add(bond.GetIdx())
+    atoms, bonds = _specified_stereo(mol)
+    if mode == 'strict':
+        lost = sorted(nodes[i] for i in {rank[n] for n in tetra} - set(atoms))
+        lost_bonds = sorted(requested_bonds - set(bonds))
+        if lost or lost_bonds:
+            raise ValueError(f'Stereo annotations on non-stereogenic nodes {lost} or '
+                             f'bonds {lost_bonds}')
+    # cleanIt removes tags on atoms and bonds that are not stereogenic ('clean' mode).
+    with _stereo_perception():
+        Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
+    return bool(cis_trans)
+
+
+def _redundant_hydrogens(graph):
+    """Nodes whose explicit H count equals the count decoding would infer."""
+    nodes = list(graph)
+    rank = {node: i for i, node in enumerate(nodes)}
+    tokens = [graph.nodes[node]['node_type'] for node in nodes]
+    explicit = [RE_ATOM_TYPE.fullmatch(token[1:-1]) for token in tokens]
+    if not any(match is not None and match['hcount'] is not None for match in explicit):
+        return []
+    bonds = [(rank[u], rank[v], SYMBOL_TO_BONDTYPE[data['edge_type']])
+             for u, v, data in graph.edges(data=True)]
+    defaults = _default_hydrogens(tokens, bonds)
+    return [node for node, match, default in zip(nodes, explicit, defaults)
+            if match is not None and match['hcount'] is not None
+            and int(match['hcount'] or 1) == default]
+
+
+def is_canonical_snack(snack):
+    """Whether every stereo annotation and explicit H count is necessary."""
+    try:
+        graph = snack_to_graph(snack)
+        graph_to_mol(graph, stereo='strict')
+    except ValueError:
+        return False
+    return not _redundant_hydrogens(graph)
+
+
+def smiles_to_graph(smiles, kekulize=True, use_hydrogens=False, use_charge=True, *,
+                    stereo=False):
+    return mol_to_graph(smiles_to_mol(smiles, kekulize), use_hydrogens, use_charge, stereo=stereo)
+
+
+def graph_to_smiles(graph, canonical=True, *, stereo='clean'):
+    return mol_to_smiles(graph_to_mol(graph, stereo=stereo), canonical)
 
 
 def smiles_to_snack(smiles, ordering='bfs', kekulize=True, use_hydrogens=False,
-                    use_charge=True, *, attributed=True):
+                    use_charge=True, *, attributed=True, stereo=False):
     """Encode SMILES with BFS by default; None preserves input atom order.
 
-    All stereochemistry is omitted. Omitting hydrogen counts or charge can
-    also make this lossy. BFS uses the package's randomized traversal.
+    Stereochemistry is omitted unless stereo=True. Omitting hydrogen counts
+    or charge can also make this lossy; use_hydrogens='auto' keeps radicals.
+    BFS uses the package's randomized traversal.
     """
-    graph = smiles_to_graph(smiles, kekulize, use_hydrogens, use_charge)
+    graph = smiles_to_graph(smiles, kekulize, use_hydrogens, use_charge, stereo=stereo)
     return graph_to_snack(graph, ordering, attributed=attributed)
 
 
-def snack_to_smiles(snack, canonical=True):
-    return graph_to_smiles(snack_to_graph(snack), canonical)
+def snack_to_smiles(snack, canonical=True, *, stereo='clean'):
+    return graph_to_smiles(snack_to_graph(snack, strict=stereo == 'strict'), canonical, stereo=stereo)
 
 
 def mol_to_snack(mol, ordering=None, *, use_hydrogens=False, use_charge=True,
-                 attributed=True):
+                 attributed=True, stereo=False):
     """Encode a molecule; use_hydrogens=False discards all H-count constraints."""
-    graph = mol_to_graph(mol, use_hydrogens, use_charge)
+    graph = mol_to_graph(mol, use_hydrogens, use_charge, stereo=stereo)
     return graph_to_snack(graph, ordering, attributed=attributed)
 
 
-def snack_to_mol(snack):
-    return graph_to_mol(snack_to_graph(snack))
+def snack_to_mol(snack, *, stereo='clean'):
+    """Decode; stereo='clean' drops meaningless annotations, 'strict' raises."""
+    return graph_to_mol(snack_to_graph(snack, strict=stereo == 'strict'), stereo=stereo)
 
 
 def randomize_smiles(smiles: str):
