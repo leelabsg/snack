@@ -1,4 +1,4 @@
-# SNACK-mol
+# SNACK
 
 > **SNACK: A Sequential Notation Framework for Probabilistic Graph Generation**
 
