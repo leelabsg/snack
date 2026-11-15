@@ -7,10 +7,17 @@ import sys
 import unittest
 
 import networkx as nx
-from rdkit import Chem
+from rdkit import Chem, rdBase
 
 import snack
-from snack.tokenizer import SnackTokenizer, basic_vocabulary
+from snack.tokenizer import SnackTokenizer, basic_vocabulary, capacity, elements, attribute_tokens, UNLIMITED
+
+ORGANIC = ('B', 'C', 'N', 'O', 'F', 'P', 'S', 'Cl', 'Br', 'I')
+MOLECULES = ['C[C@H](N)C(=O)O', 'F/C=C/F', 'F/C=C\\F', '[CH2]C', 'C[N+](C)(C)C', '[O-]C(=O)C',
+             'c1cc[nH]c1', '[Cu]I', 'O=[PH3]', 'C[S@](=O)CC', '[Fe+3]', 'C[Si](C)(C)C',
+             '[H][H]', '[NH4+]', 'CS(C)(=O)=O', '[O][O]', 'O=[N+]([O-])c1ccccc1', 'F[B-](F)(F)F',
+             'C[C@@H]1CC(Nc2cncc(-c3nncn3C)c2)C[C@@H](C)C1', 'C[C@H](O)/C=C/[C@@H](F)Cl', '[C]',
+             'CCCC[Sn](CCCC)(CCCC)c1nc2ccccc2nc1C', '[O-][n+]1ccccc1', 'C[CH-]C', '[BH4-]', 'F[Kr]F']
 
 
 class TokenizerTests(unittest.TestCase):
@@ -26,94 +33,123 @@ class TokenizerTests(unittest.TestCase):
         prefix = [tokenizer.bos_id] + tokenizer.encode(text, add_special_tokens=False)
         return {tokenizer.tokens[i] for i in tokenizer.allowed_next_ids(prefix)}
 
-    def test_vocabulary_and_exact_roundtrip(self):
-        examples = [('graph', 'v1_v2_1_v'), ('moses', '[C]1-[N]1=[O]'),
-                    ('zinc250k', '[NH2+]1-[C]1-[O-]'),
-                    ('guacamol', '[SiH2]1-[Se]1-[B-]')]
-        for preset, text in examples:
-            with self.subTest(preset=preset):
-                tokenizer = SnackTokenizer(preset)
-                self.assertEqual(tuple(basic_vocabulary(preset)), tokenizer.tokens)
-                ids = tokenizer.encode(text)
-                self.assertTrue(all(isinstance(index, int) for index in ids))
-                self.assertEqual(tokenizer.decode(ids + [tokenizer.pad_id] * 3), text)
-                self.assertEqual(tokenizer.decode(tokenizer.encode(text, add_special_tokens=False)), text)
-        self.assertIn('[P+]', basic_vocabulary('zinc250k'))
-        self.assertNotIn('[P+]', basic_vocabulary('moses'))
+    def attributes_allowed(self, tokenizer, text):
+        return {token for token in self.allowed(tokenizer, text) if token.startswith('(')}
 
-    def test_guacamol_vocabulary_and_limits(self):
-        tokenizer = SnackTokenizer('guacamol')
-        self.assertEqual(tokenizer.max_nodes, 88)
-        self.assertEqual(tokenizer.max_distance, 87)
-        for token in ('[B]', '[B-]', '[C+]', '[Si]', '[Si-]', '[Se]', '[Se+]', '[Se-]',
-                      '[Cl-]', '[Br+2]', '[Cl+3]', '[I+3]', '[P-]', '[IH2]', '[SiH-]'):
+    # ----- vocabulary ----------------------------------------------------------
+    def test_default_vocabulary_is_general(self):
+        isotope_tokens = set(attribute_tokens(('isotope',)))
+        self.assertEqual(len(isotope_tokens), 294)
+        tokenizer = SnackTokenizer()
+        self.assertEqual(tuple(basic_vocabulary()), tokenizer.tokens)
+        self.assertEqual(len(tokenizer), 1471)
+        # Excluding the isotope kind reproduces the vocabulary that predates it.
+        without = SnackTokenizer(attributes=('charge', 'hydrogens', 'chirality', 'cis_trans'))
+        self.assertEqual(len(without), 1177)
+        self.assertEqual(without.tokens, tuple(t for t in tokenizer.tokens
+                                               if t not in isotope_tokens))
+        self.assertEqual(tokenizer.tokens[:3], ('[pad]', '[bos]', '[eos]'))
+        self.assertEqual(len(elements()), 119)
+        self.assertEqual(elements()[:3], ('H', 'He', 'Li'))
+        self.assertEqual(elements()[-2:], ('Og', '*'))
+        for token in ('H', 'C', 'Cl', 'Og', '*', '-', '=', '#', '(@)', '(@@)', '(H0)', '(H)', '(H8)', '(+)',
+                      '(+2)', '(+8)', '(-)', '(-8)', '(c)', '(t)', '1', str(tokenizer.max_distance)):
             self.assertIn(token, tokenizer.token_to_id)
-        self.assertIn('87', tokenizer.token_to_id)
-        self.assertNotIn('88', tokenizer.token_to_id)
-        limited = SnackTokenizer('guacamol', max_nodes=2, ordering='bfs')
-        self.assertEqual(self.allowed(limited, '[B]1-[Si]'), {'[eos]'})
-        self.assertNotIn('[IH2]', basic_vocabulary('zinc250k'))
+        self.assertEqual(tokenizer.max_nodes, 1024)
+        for token in ('(+9)', '(-9)', '(H9)', '(.)', '(.2)', '0', '1024', 'o', '[C]', 'c',
+                      '(0)', '(295)', '(13C)'):
+            self.assertNotIn(token, tokenizer.token_to_id)
+        self.assertEqual(tokenizer.node_types, elements())
+        self.assertEqual(tokenizer.edge_types, ('-', '=', '#'))
+        # Attribute tokens are the last block, grouped by kind in the canonical order.
+        kinds = [snack.graph.parse_attribute(token)[0] for token in tokenizer.attribute_types]
+        self.assertEqual(kinds, sorted(kinds, key=list(snack.graph.ATTRIBUTES).index))
+        self.assertEqual(tuple(dict.fromkeys(kinds)),
+                         ('isotope', 'charge', 'hydrogens', 'chirality', 'cis_trans'))
+        self.assertEqual(tokenizer.token_to_id['C'], 8)
+        self.assertEqual(tokenizer.token_to_id['1'], 3 + 119)
 
-    def test_guacamol_rare_atoms_roundtrip_with_valence_masks(self):
-        # Includes actual GuacaMol motifs that the old valence table excluded:
-        # valence-6 P-, valence-5 Si-, and neutral hypervalent iodine.
-        examples = ['B(O)(O)O', '[B-](F)(F)(F)F', 'C[Si](C)(C)C', 'C[Se]C',
-                    'C[Si](C)(C)c1ccccc1', 'c1cc[se]c1', 'c1ccc2c(c1)[IH]c1ccccc1-2',
-                    'C[Se+](C)C', 'N#C[Se-]', 'F[P-](F)(F)(F)(F)F',
-                    'F[Si-](F)(C)(C)C', 'C[IH2](O)O', 'O[I+2](O)O',
-                    'O[I+3](O)(O)O', 'C[I+]C', 'O[Cl+2](O)O',
-                    'O[Cl+3](O)(O)O', 'O[Br+2](O)O', '[O-][Cl+]O',
-                    'C[F+]C', 'C[CH2+]', '[F-]', '[Cl-]', '[Br-]', '[I-]']
-        for node_first, ascending in itertools.product((False, True), repeat=2):
-            snack.config.set(node_first, ascending)
-            base = SnackTokenizer('guacamol')
-            tokenizer = SnackTokenizer('guacamol', ordering='bfs', allowed_node_types=base.node_types)
-            for smiles in examples:
-                with self.subTest(smiles=smiles, node_first=node_first, ascending=ascending):
-                    mol = snack.smiles_to_mol(smiles)
-                    text = snack.mol_to_snack(mol, ordering='bfs', use_hydrogens=True)
-                    ids = tokenizer.encode(text, validate=True)
-                    self.assertEqual(tokenizer.decode(ids), text)
-                    restored = snack.snack_to_mol(tokenizer.decode(ids))
-                    # Input conversion kekulizes; restore aromaticity before
-                    # comparing canonical SMILES with the sanitized output.
-                    Chem.SanitizeMol(mol)
-                    self.assertEqual(Chem.MolToSmiles(restored), Chem.MolToSmiles(mol))
+    def test_isotope_masks(self):
+        tokenizer = SnackTokenizer(max_nodes=4)
+        # A mass number may follow any node, and must come before the others.
+        self.assertTrue({'(1)', '(2)', '(13)', '(294)'} <= self.attributes_allowed(tokenizer, 'C'))
+        self.assertTrue({'(13)'} <= self.attributes_allowed(tokenizer, 'F'))
+        self.assertTrue({'(13)'}.isdisjoint(self.attributes_allowed(tokenizer, 'C(+)')))
+        self.assertTrue({'(13)'}.isdisjoint(self.attributes_allowed(tokenizer, 'C(13)')))
+        for text in ('C(+)(13)', 'C(H3)(13)', 'C(@)(13)', 'C(13)(13)', 'C(0)', 'C1-(13)C'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                tokenizer.encode(text, validate=True)
+        tokenizer.encode('C(13)(+)(H3)(@)', validate=True)
+        # An isotope leaves the valence untouched: the same hydrogens are allowed.
+        self.assertEqual({t for t in self.attributes_allowed(tokenizer, 'C(13)')
+                          if t.startswith('(H')},
+                         {t for t in self.attributes_allowed(tokenizer, 'C') if t.startswith('(H')})
+        self.assertEqual(snack.snack_to_smiles('C(13)(+)(H3)'), '[13CH3+]')
 
-    def test_guacamol_halide_ions_and_bond_capacity(self):
-        tokenizer = SnackTokenizer('guacamol', max_nodes=8)
-        for ion in ('[F-]', '[Cl-]', '[Br-]', '[I-]'):
-            self.assertEqual(self.allowed(tokenizer, ion), {'[eos]'})
-            self.assertNotIn(ion, self.allowed(tokenizer, '[C]1-'))
-            with self.assertRaises(ValueError):
-                tokenizer.encode(ion + '1-[C]', validate=True)
-        self.assertNotIn('4', self.allowed(tokenizer, '[B]1-[C]2-[C]3-[C]'))
-        self.assertIn('4', self.allowed(tokenizer, '[B-]1-[C]2-[C]3-[C]'))
-        self.assertEqual(self.allowed(tokenizer, '[Si]1-[C]2-[C]3-[C]4'), {'-'})
-        zinc = SnackTokenizer('zinc250k')
-        self.assertNotIn('2', self.allowed(zinc, '[I]1-[C]'))
-        self.assertIn('2', self.allowed(tokenizer, '[I]1-[C]'))
-        disconnected = SnackTokenizer('guacamol', allow_disconnected=True, ordering='bfs')
-        disconnected.encode('[C][Cl-]', validate=True)
-
-    def test_bad_inputs(self):
+    def test_attribute_selection_and_graph_preset(self):
+        charged = SnackTokenizer(attributes=('charge',))
+        self.assertTrue(all(snack.graph.parse_attribute(t)[0] == 'charge' for t in charged.attribute_types))
+        self.assertEqual(attribute_tokens(('cis_trans',)), ['(c)', '(t)'])
+        self.assertEqual(attribute_tokens(('hydrogens',), max_hydrogens=2), ['(H0)', '(H)', '(H2)'])
+        self.assertEqual(attribute_tokens(('chirality',)), ['(@)', '(@@)'])
+        self.assertEqual(attribute_tokens(('isotope',), max_isotope=3), ['(1)', '(2)', '(3)'])
+        graph = SnackTokenizer('graph', max_nodes=3)
+        self.assertEqual(graph.tokens, ('[pad]', '[bos]', '[eos]', 'o', '1', '2', '-'))
+        with self.assertRaises(ValueError):
+            SnackTokenizer('graph', attributes=('charge',))
         for kwargs in ({'max_nodes': 0}, {'max_nodes': True}, {'max_nodes': 3, 'max_distance': 3},
-                       {'ordering': 'cm'}, {'preset': 'unknown'}, {'valence': True}):
+                       {'ordering': 'cm'}, {'preset': 'zinc250k'}, {'preset': 'graph', 'valence': True},
+                       {'attributes': ('mass',)}, {'attributes': ('radical',)}, {'edge_types': ['a']},
+                       {'node_types': ['C+']}, {'node_types': ['[C]']}, {'node_types': ['Xx']},
+                       {'allowed_node_types': ['Xx']}, {'allowed_node_types': ['[C]']}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 SnackTokenizer(**kwargs)
+
+    def test_exact_roundtrip_and_special_tokens(self):
+        for preset, text in (('graph', 'o1-o2-1-o'), ('mol', 'C1-C(@)1-N(+)(H)2-C1=(t)C1-O(-)'),
+                             ('mol', 'Fe(+3)'), ('mol', 'Na(+)Cl(-)'), ('mol', 'Cl1-C1-Br'), ('mol', '*1-C')):
+            with self.subTest(text=text):
+                tokenizer = SnackTokenizer(preset)
+                ids = tokenizer.encode(text)
+                self.assertTrue(all(isinstance(index, int) for index in ids))
+                self.assertEqual(ids[0], tokenizer.bos_id)
+                self.assertEqual(ids[-1], tokenizer.eos_id)
+                self.assertEqual(tokenizer.decode(ids + [tokenizer.pad_id] * 3), text)
+                self.assertEqual(tokenizer.decode(tokenizer.encode(text, add_special_tokens=False)), text)
+                self.assertEqual(tokenizer(text), {'input_ids': ids})
         tokenizer = SnackTokenizer()
         for ids in ([999999], [-1], [True], [1.0], [tokenizer.eos_id, tokenizer.bos_id],
-                    [tokenizer.pad_id, tokenizer.token_to_id['v']]):
+                    [tokenizer.pad_id, tokenizer.token_to_id['C']]):
             with self.subTest(ids=ids), self.assertRaises(ValueError):
                 tokenizer.decode(ids)
+        for text in ('o', 'C{@}', '[C]', 'c1-C', 'C(.)', 'Xx'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                tokenizer.encode(text)
         with self.assertRaises(ValueError):
-            tokenizer.encode('[C]')
-        with self.assertRaises(ValueError):
-            tokenizer.encode('v?')
+            SnackTokenizer('graph').encode('C')
 
+    def test_capacity_follows_rdkit(self):
+        self.assertEqual(capacity('C'), 4)
+        self.assertEqual(capacity('C', 1), 3)
+        self.assertEqual(capacity('C', -1), 3)
+        self.assertEqual(capacity('N', 1), 4)
+        self.assertEqual(capacity('O', -1), 1)
+        self.assertEqual(capacity('B', -1), 4)
+        self.assertEqual(capacity('S'), 6)
+        self.assertEqual(capacity('He'), 0)
+        self.assertIsNone(capacity('He', -1))
+        self.assertEqual(capacity('Fe'), UNLIMITED)
+        self.assertEqual(capacity('*'), UNLIMITED)
+        # With a given H count RDKit ignores noble-gas limits and relaxes some charged states.
+        self.assertEqual(capacity('He', 0, lenient=True), UNLIMITED)
+        self.assertEqual(capacity('N', 0, lenient=True), 3)
+        self.assertEqual(capacity('C', 1, lenient=True), 5)
+        self.assertEqual(capacity('Sn', 2, lenient=True), 6)
+
+    # ----- graph preset grammar ------------------------------------------------
     def test_shifted_masks_and_padding(self):
-        tokenizer = SnackTokenizer(max_nodes=3, ordering='bfs')
-        ids = tokenizer.encode('v1_v1_v', validate=True)
+        tokenizer = SnackTokenizer('graph', max_nodes=3, ordering='bfs')
+        ids = tokenizer.encode('o1-o1-o', validate=True)
         masks = tokenizer.get_logit_mask(ids)
         self.assertEqual(len(masks), len(ids))
         self.assertTrue(all(len(row) == len(tokenizer) for row in masks))
@@ -121,29 +157,28 @@ class TokenizerTests(unittest.TestCase):
             self.assertTrue(masks[position][target])
         self.assertEqual(tokenizer.allowed_next_ids(ids), [tokenizer.pad_id])
         self.assertEqual(tokenizer.next_token_mask(ids), masks[-1])
-        self.assertEqual(tokenizer('v1_v'), {'input_ids': tokenizer.encode('v1_v')})
 
     def test_grammar_and_connectedness(self):
-        tokenizer = SnackTokenizer(max_nodes=4)
+        tokenizer = SnackTokenizer('graph', max_nodes=4)
         self.assertEqual(tokenizer.allowed_next_ids([]), [tokenizer.bos_id])
-        self.assertEqual(self.allowed(tokenizer, ''), {'v'})
-        self.assertNotIn('v', self.allowed(tokenizer, 'v'))
-        self.assertNotIn('[eos]', self.allowed(tokenizer, 'v1_'))
-        self.assertEqual(self.allowed(tokenizer, 'v1_'), {'v'})
-        for text in ('v0_v', 'v2_v', 'v1_1_v', 'vv', 'v1_v1_2_v', 'v1_'):
+        self.assertEqual(self.allowed(tokenizer, ''), {'o'})
+        self.assertNotIn('o', self.allowed(tokenizer, 'o'))
+        self.assertNotIn('[eos]', self.allowed(tokenizer, 'o1-'))
+        self.assertEqual(self.allowed(tokenizer, 'o1-'), {'o'})
+        for text in ('v0_v', 'o2-o', 'o1-1-o', 'oo', 'o1-o1-2-o', 'o1-'):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 tokenizer.encode(text, validate=True)
-        disconnected = SnackTokenizer(max_nodes=4, allow_disconnected=True)
-        disconnected.encode('vv2_1_vv', validate=True)
+        disconnected = SnackTokenizer('graph', max_nodes=4, allow_disconnected=True)
+        disconnected.encode('oo2-1-oo', validate=True)
 
     def test_bfs_parent_must_not_move_backwards(self):
-        unconstrained = SnackTokenizer(max_nodes=4)
-        bfs = SnackTokenizer(max_nodes=4, ordering='bfs')
-        unconstrained.encode('v1_v1_v3_v', validate=True)
+        unconstrained = SnackTokenizer('graph', max_nodes=4)
+        bfs = SnackTokenizer('graph', max_nodes=4, ordering='bfs')
+        unconstrained.encode('o1-o1-o3-o', validate=True)
         with self.assertRaises(ValueError):
-            bfs.encode('v1_v1_v3_v', validate=True)
-        self.assertNotIn('3_', self.allowed(bfs, 'v1_v1_v'))
-        self.assertIn('2_', self.allowed(bfs, 'v1_v1_v'))
+            bfs.encode('o1-o1-o3-o', validate=True)
+        self.assertNotIn('3', self.allowed(bfs, 'o1-o1-o'))
+        self.assertIn('2', self.allowed(bfs, 'o1-o1-o'))
 
     def test_bfs_matches_independent_exhaustive_oracle(self):
         # Every labeled simple graph through four nodes, across all four layouts.
@@ -161,7 +196,7 @@ class TokenizerTests(unittest.TestCase):
                 valid_bfs = expected_order == list(graph)
                 for node_first, ascending in itertools.product((False, True), repeat=2):
                     snack.config.set(node_first, ascending)
-                    tokenizer = SnackTokenizer(max_nodes=size, ordering='bfs', allow_disconnected=True)
+                    tokenizer = SnackTokenizer('graph', max_nodes=size, ordering='bfs', allow_disconnected=True)
                     text = snack.graph_to_snack(graph)
                     with self.subTest(size=size, bits=bits, node_first=node_first, ascending=ascending):
                         if valid_bfs:
@@ -171,194 +206,268 @@ class TokenizerTests(unittest.TestCase):
                                 tokenizer.encode(text, validate=True)
 
     def test_disconnected_bfs_cannot_reopen_previous_component(self):
-        tokenizer = SnackTokenizer(max_nodes=6, ordering='bfs', allow_disconnected=True)
-        tokenizer.encode('v1_vv1_v', validate=True)
+        tokenizer = SnackTokenizer('graph', max_nodes=6, ordering='bfs', allow_disconnected=True)
+        tokenizer.encode('o1-oo1-o', validate=True)
         with self.assertRaises(ValueError):
-            tokenizer.encode('v1_vv2_v', validate=True)
+            tokenizer.encode('o1-oo2-o', validate=True)
 
     def test_node_limit_includes_all_components(self):
-        tokenizer = SnackTokenizer(max_nodes=3, allow_disconnected=True, ordering='bfs')
-        self.assertEqual(self.allowed(tokenizer, 'vvv'), {'[eos]'})
-        tokenizer = SnackTokenizer(max_nodes=3)
-        self.assertEqual(self.allowed(tokenizer, 'v1_v1_v'), {'[eos]'})
-        tokenizer = SnackTokenizer(max_nodes=1)
-        self.assertEqual(self.allowed(tokenizer, 'v'), {'[eos]'})
+        tokenizer = SnackTokenizer('graph', max_nodes=3, allow_disconnected=True, ordering='bfs')
+        self.assertEqual(self.allowed(tokenizer, 'ooo'), {'[eos]'})
+        tokenizer = SnackTokenizer('graph', max_nodes=3)
+        self.assertEqual(self.allowed(tokenizer, 'o1-o1-o'), {'[eos]'})
+        tokenizer = SnackTokenizer('graph', max_nodes=1)
+        self.assertEqual(self.allowed(tokenizer, 'o'), {'[eos]'})
 
     def test_node_first_finishes_last_node_edges_before_eos(self):
-        tokenizer = SnackTokenizer(max_nodes=2, node_first=True)
-        self.assertEqual(self.allowed(tokenizer, 'vv'), {'1_'})
-        self.assertEqual(self.allowed(tokenizer, 'vv1_'), {'[eos]'})
+        tokenizer = SnackTokenizer('graph', max_nodes=2, node_first=True)
+        self.assertEqual(self.allowed(tokenizer, 'oo'), {'1'})
+        self.assertEqual(self.allowed(tokenizer, 'oo1'), {'-'})
+        self.assertEqual(self.allowed(tokenizer, 'oo1-'), {'[eos]'})
 
     def test_settings_are_captured_without_global_mutation(self):
-        tokenizer = SnackTokenizer(node_first=False, ascending=False, max_nodes=3)
-        before = self.allowed(tokenizer, 'v1_v')
+        tokenizer = SnackTokenizer('graph', node_first=False, ascending=False, max_nodes=3)
+        before = self.allowed(tokenizer, 'o1-o')
         snack.config.set(True, True)
-        self.assertEqual(self.allowed(tokenizer, 'v1_v'), before)
+        self.assertEqual(self.allowed(tokenizer, 'o1-o'), before)
         self.assertTrue(snack.config.NODE_FIRST)
         self.assertTrue(snack.config.ASCENDING)
 
+    # ----- molecular masks -----------------------------------------------------
     def test_typed_distance_requires_a_bond(self):
-        tokenizer = SnackTokenizer('moses', max_nodes=4)
-        self.assertEqual(self.allowed(tokenizer, '[C]1'), {'-', '=', '#'})
-        self.assertEqual(self.allowed(tokenizer, '[F]1'), {'-'})
-        self.assertNotIn('[eos]', self.allowed(tokenizer, '[C]1-'))
-        for text in ('[C]1[C]', '[C]1_ [C]', '[C]-[C]'):
+        tokenizer = SnackTokenizer(max_nodes=4)
+        self.assertEqual(self.allowed(tokenizer, 'C1'), {'-', '=', '#'})
+        self.assertEqual(self.allowed(tokenizer, 'F1'), {'-'})
+        self.assertEqual(self.allowed(tokenizer, 'O1'), {'-', '='})
+        self.assertNotIn('[eos]', self.allowed(tokenizer, 'C1-'))
+        for text in ('C1C', 'C1_C', 'C-C', 'F1=C'):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 tokenizer.encode(text, validate=True)
 
-    def test_endpoint_valences_and_charge(self):
-        tokenizer = SnackTokenizer('zinc250k', max_nodes=6)
-        self.assertEqual(self.allowed(tokenizer, '[O]1'), {'-', '='})
-        self.assertNotIn('2', self.allowed(tokenizer, '[F]1-[C]'))
-        with self.assertRaises(ValueError):
-            tokenizer.encode('[F]1=[C]', validate=True)
-        # Fourth single bond into atom zero violates N but is allowed for N+.
-        neutral = '[N]1-[C]2-[C]3-[C]'
-        charged = '[N+]1-[C]2-[C]3-[C]'
-        self.assertNotIn('4', self.allowed(tokenizer, neutral))
-        self.assertIn('4', self.allowed(tokenizer, charged))
+    def test_two_letter_elements_tokenize_greedily(self):
+        tokenizer = SnackTokenizer(max_nodes=4)
+        self.assertEqual(snack.split('Cl1-C1-Br'), ['Cl', '1', '-', 'C', '1', '-', 'Br'])
+        self.assertEqual(snack.split('Co1-O'), ['Co', '1', '-', 'O'])
+        ids = tokenizer.encode('Cl1-C1-Br', validate=True)
+        self.assertEqual([tokenizer.tokens[i] for i in ids[1:-1]], ['Cl', '1', '-', 'C', '1', '-', 'Br'])
+        self.assertEqual(snack.snack_to_smiles(tokenizer.decode(ids)), 'ClCBr')
+
+    def test_charge_extends_valence(self):
+        tokenizer = SnackTokenizer(max_nodes=6)
+        # Fourth single bond into atom zero violates N but is allowed for N(+).
+        self.assertNotIn('4', self.allowed(tokenizer, 'N1-C2-C3-C'))
+        self.assertIn('4', self.allowed(tokenizer, 'N(+)1-C2-C3-C'))
+        self.assertNotIn('2', self.allowed(tokenizer, 'F1-C'))
+        self.assertNotIn('2', self.allowed(tokenizer, 'O(-)1-C'))
         # Four bonds already placed on the pending atom: it must support valence 4.
-        pending = '[C]1-[C]1-[C]3-2-1='
+        pending = 'C1-C1-C3-2-1='
         allowed = self.allowed(tokenizer, pending)
-        self.assertIn('[C]', allowed)
-        self.assertIn('[N+]', allowed)
-        self.assertNotIn('[N]', allowed)
-        self.assertNotIn('[O]', allowed)
+        self.assertIn('C', allowed)
+        self.assertIn('N', allowed)    # fixable by (+)
+        self.assertIn('Fe', allowed)
+        self.assertIn('F', allowed)    # RDKit accepts four bonds on F(+3)
+        self.assertIn('He', allowed)   # accepted once its H count is given
+        # Without charge or hydrogens tokens the element alone must carry the bonds.
+        neutral = SnackTokenizer(max_nodes=6, attributes=('chirality',))
+        allowed = self.allowed(neutral, pending)
+        self.assertIn('C', allowed)
+        self.assertNotIn('N', allowed)
+        self.assertNotIn('F', allowed)
+        self.assertNotIn('He', allowed)
+        # After an over-bonded neutral N only a charge token can follow.
+        allowed = self.allowed(tokenizer, pending + 'N')
+        self.assertNotIn('[eos]', allowed)
+        self.assertNotIn('C', allowed)
+        self.assertFalse(any(token.isdigit() for token in allowed))
+        self.assertTrue(all(snack.graph.parse_attribute(token)[0] in ('charge', 'isotope')
+                            for token in allowed))
+        # A mass number does not repair the valence, so a charge is still required.
+        after_isotope = self.allowed(tokenizer, pending + 'N(13)')
+        self.assertNotIn('[eos]', after_isotope)
+        self.assertTrue(all(snack.graph.parse_attribute(token)[0] == 'charge'
+                            for token in after_isotope))
+        self.assertIn('(+)', allowed)
+        self.assertNotIn('(-)', allowed)
+        after_fix = self.allowed(tokenizer, pending + 'N(+)')
+        self.assertEqual({t for t in after_fix if not t.isdigit()}, {'(H0)', '(@)', '(@@)', '[eos]'})
+        with self.assertRaises(ValueError):
+            tokenizer.encode(pending + 'N', validate=True)
+        tokenizer.encode(pending + 'N(+)', validate=True)
+
+    def test_attribute_order_and_capacity(self):
+        # Without the isotope kind, whose tokens are allowed after every node
+        # and would swamp these sets; test_isotope_masks covers it separately.
+        tokenizer = SnackTokenizer(max_nodes=4,
+                                   attributes=('charge', 'hydrogens', 'chirality', 'cis_trans'))
+        after_c = self.attributes_allowed(tokenizer, 'C')
+        self.assertEqual(after_c, {'(+)', '(+2)', '(+3)', '(+4)', '(+5)', '(+6)', '(+7)', '(+8)',
+                                   '(-)', '(-2)', '(-3)', '(-4)', '(H0)', '(H)', '(H2)', '(H3)', '(H4)',
+                                   '(@)', '(@@)'})
+        # Each attribute kind at most once, in order charge, hydrogens, chirality.
+        # RDKit allows up to five hydrogens on a C+ with a given H count.
+        self.assertEqual(self.attributes_allowed(tokenizer, 'C(+)'),
+                         {'(H0)', '(H)', '(H2)', '(H3)', '(H4)', '(H5)', '(@)', '(@@)'})
+        self.assertEqual(self.attributes_allowed(tokenizer, 'C(+)(H3)'), {'(@)', '(@@)'})
+        self.assertEqual(self.attributes_allowed(tokenizer, 'C(+)(H3)(@)'), set())
+        self.assertIn('[eos]', self.allowed(tokenizer, 'C(+)(H3)(@)'))
+        self.assertEqual(self.attributes_allowed(tokenizer, 'C(H3)'), {'(@)', '(@@)'})
+        self.assertEqual(self.attributes_allowed(tokenizer, 'C(@)'), set())
+        for text in ('C(@)(+)', 'C(H)(+)', 'C(@)(H)', 'C(+)(+)', 'C(H)(H)', 'C(@)(@@)', 'C(.)',
+                     'C(H9)', 'F(@)', 'C1-(+)C', 'C(H4)(@)(+)', 'C(+9)'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                tokenizer.encode(text, validate=True)
+        tokenizer.encode('C(-)(H2)(@)', validate=True)
+        self.assertEqual(snack.snack_to_smiles('C(+)(H3)'), '[CH3+]')
+        fluorine = self.attributes_allowed(tokenizer, 'F')
+        self.assertTrue({'(+)', '(-)', '(H)', '(H0)'} <= fluorine)
+        self.assertTrue({'(@)', '(@@)', '(H2)', '(-2)'}.isdisjoint(fluorine))
+        # Helium has no valence to spare unless its H count is given, which RDKit never limits.
+        helium = self.attributes_allowed(tokenizer, 'He')
+        self.assertTrue({'(+)', '(-)', '(H0)', '(H8)'} <= helium)   # RDKit accepts [He-] with a given H count
+        self.assertNotIn('(@)', helium)
+        # A complete node: only EOS or the next node's first edge may follow.
+        self.assertEqual(self.allowed(tokenizer, 'He(H0)'), {'1', '[eos]'})
+        self.assertEqual(snack.snack_to_smiles('He(H0)'), '[He]')
+
+    def test_cis_trans_only_after_double_bonds(self):
+        tokenizer = SnackTokenizer(max_nodes=4)
+        self.assertTrue({'(c)', '(t)'} <= self.allowed(tokenizer, 'C1='))
+        self.assertEqual(self.attributes_allowed(tokenizer, 'C1-'), set())
+        self.assertEqual(self.attributes_allowed(tokenizer, 'C1=(t)'), set())
+        self.assertEqual(self.attributes_allowed(tokenizer, 'C1'), set())
+        for text in ('C1-(c)C', 'C1=(c)(t)C', 'C(t)'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                tokenizer.encode(text, validate=True)
+
+    def test_node_first_keeps_room_for_the_backward_edge(self):
+        tokenizer = SnackTokenizer(max_nodes=3, node_first=True)
+        # F after C must bond back, so it may not spend its only valence on a hydrogen;
+        # (H0) is fine, and so is a charge that leaves room.
+        after_f = self.allowed(tokenizer, 'CF')
+        self.assertIn('(H0)', after_f)
+        self.assertNotIn('(H)', after_f)
+        self.assertIn('(+)', after_f)
+        self.assertNotIn('(-)', after_f)   # F(-) has no valence left for the bond
+        self.assertNotIn('[eos]', after_f)
+        self.assertIn('(H)', self.allowed(tokenizer, 'F'))   # the first node needs no backward edge
+        loose = SnackTokenizer(max_nodes=3, node_first=True, allow_disconnected=True)
+        self.assertIn('(H)', self.allowed(loose, 'CF'))
+        self.assertEqual(self.allowed(tokenizer, 'CF(H0)'), {'1'})
+        self.assertEqual(self.allowed(tokenizer, 'CF1'), {'-'})
+        self.assertEqual(self.allowed(tokenizer, 'C(H3)F1-'), {'[eos]'})
+        self.assertEqual(self.allowed(tokenizer, 'C(H4)'), {'(@)', '(@@)', '[eos]'})
+        self.assertNotIn('F', self.allowed(tokenizer, 'C(H4)(@)'))
 
     def test_whitelists_restrict_generation_but_not_encoding(self):
-        tokenizer = SnackTokenizer('zinc250k', allowed_node_types=['[C]', '[O]'],
-                                   allowed_edge_types=['-'])
-        self.assertEqual(self.allowed(tokenizer, ''), {'[C]', '[O]'})
-        self.assertEqual(self.allowed(tokenizer, '[C]1'), {'-'})
-        self.assertEqual(tokenizer.decode(tokenizer.encode('[N]')), '[N]')
+        tokenizer = SnackTokenizer(allowed_node_types=['C', 'O'], allowed_edge_types=['-'])
+        self.assertEqual(self.allowed(tokenizer, ''), {'C', 'O'})
+        self.assertEqual(self.allowed(tokenizer, 'C1'), {'-'})
+        self.assertEqual(tokenizer.decode(tokenizer.encode('N')), 'N')
         with self.assertRaises(ValueError):
-            tokenizer.encode('[N]', validate=True)
-
-    def test_unsupported_chemistry_is_explicit(self):
-        for kwargs in ({'edge_types': ['a']}, {'edge_types': ['(dative)']},
-                       {'node_types': ['[C@H]']}, {'node_types': ['[13C]']},
-                       {'node_types': ['[C;r=1]']}, {'node_types': ['[*]']}):
-            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
-                SnackTokenizer('zinc250k', **kwargs)
-        encoder = SnackTokenizer('zinc250k', node_types=['[C]'],
-                                 edge_types=['(contact)'], valence=False)
-        text = '[C]1(contact)[C]'
-        self.assertEqual(encoder.decode(encoder.encode(text)), text)
-
-    def test_stereochemical_inputs_convert_to_basic_vocabulary(self):
-        for preset in ('zinc250k', 'moses', 'guacamol'):
-            tokenizer = SnackTokenizer(preset, ordering='bfs')
-            for smiles in ('F/C=C/F', 'F/C=C\\F', 'C[C@H](O)/C=C/[C@@H](F)Cl'):
-                with self.subTest(preset=preset, smiles=smiles):
-                    text = snack.smiles_to_snack(smiles)
-                    ids = tokenizer.encode(text, validate=True)
-                    expected = Chem.MolFromSmiles(smiles)
-                    Chem.RemoveStereochemistry(expected)
-                    self.assertEqual(snack.snack_to_smiles(tokenizer.decode(ids)),
-                                     Chem.MolToSmiles(expected))
-
-    def test_explicit_hydrogens_allow_radicals_but_limit_bond_capacity(self):
-        tokenizer = SnackTokenizer('moses', node_types=['[NH]', '[C]'], max_nodes=3)
-        self.assertIn('[eos]', self.allowed(tokenizer, '[NH]'))
-        self.assertEqual(self.allowed(tokenizer, '[NH]1'), {'-', '='})
-        tokenizer.encode('[NH]1=[C]', validate=True)
-        tokenizer.encode('[NH]1-[C]', validate=True)
+            tokenizer.encode('N', validate=True)
         with self.assertRaises(ValueError):
-            tokenizer.encode('[NH]1#[C]', validate=True)
-        for text, radicals in (('[NH]', 2), ('[NH]1-[C]', 1), ('[NH]1=[C]', 0)):
-            mol = snack.snack_to_mol(tokenizer.decode(tokenizer.encode(text, validate=True)))
-            self.assertEqual(sum(a.GetNumRadicalElectrons() for a in mol.GetAtoms()), radicals)
-        # Presets encode H-constrained atoms but default generation uses implicit H.
-        preset = SnackTokenizer('moses')
-        self.assertIn('[NH]', preset.node_types)
-        self.assertNotIn('[NH]', self.allowed(preset, ''))
+            tokenizer.encode('C1=C', validate=True)
+        custom = SnackTokenizer(node_types=['C', 'N'], edge_types=['-', '='], attributes=('charge',))
+        self.assertEqual(custom.node_types, ('C', 'N'))
+        self.assertNotIn('(@)', custom.token_to_id)
+        self.assertNotIn('Cl', custom.token_to_id)
+        custom.encode('C1-N(+)', validate=True)
+        with self.assertRaises(ValueError):
+            custom.encode('C1#N', validate=True)
+        with self.assertRaises(ValueError):
+            custom.encode('Cl1-C')
 
-    def test_radical_corpus_motifs_use_existing_hydrogen_tokens(self):
-        examples = ('[CH2]c1c[nH]c2ccccc12', '[CH]=CCc1c[nH]c2ccc(F)cc12',
-                    '[N]=O', 'C[O]', '[B]C', '[C]', '[CH2-]')
-        for node_first, ascending, hydrogens in itertools.product((False, True), repeat=3):
+    def test_valence_false_only_checks_grammar(self):
+        tokenizer = SnackTokenizer(max_nodes=4, valence=False)
+        tokenizer.encode('F1#F', validate=True)
+        self.assertEqual(self.allowed(tokenizer, 'F1'), {'-', '=', '#'})
+
+    def test_encoded_molecules_pass_masks(self):
+        for node_first, ascending in itertools.product((False, True), repeat=2):
             snack.config.set(node_first, ascending)
-            base = SnackTokenizer('guacamol')
-            tokenizer = SnackTokenizer('guacamol', ordering='bfs', allowed_node_types=base.node_types)
-            for smiles in examples:
-                with self.subTest(smiles=smiles, node_first=node_first,
-                                  ascending=ascending, hydrogens=hydrogens):
-                    text = snack.smiles_to_snack(smiles, ordering='bfs', use_hydrogens=hydrogens)
-                    self.assertNotIn(';r=', text)
+            tokenizer = SnackTokenizer(ordering='bfs', node_first=node_first, ascending=ascending)
+            for smiles, seed in itertools.product(MOLECULES, range(2)):
+                random.seed(seed)
+                text = snack.smiles_to_snack(smiles)
+                with self.subTest(smiles=smiles, node_first=node_first, ascending=ascending, seed=seed):
                     ids = tokenizer.encode(text, validate=True)
                     self.assertEqual(tokenizer.decode(ids), text)
                     masks = tokenizer.get_logit_mask(ids)
                     self.assertTrue(all(masks[i][target] for i, target in enumerate(ids[1:])))
-                    restored = snack.snack_to_mol(tokenizer.decode(ids))
-                    original = Chem.MolFromSmiles(smiles)
-                    if hydrogens:
-                        self.assertEqual(Chem.MolToSmiles(restored), Chem.MolToSmiles(original))
-                        self.assertEqual(sum(a.GetNumRadicalElectrons() for a in restored.GetAtoms()),
-                                         sum(a.GetNumRadicalElectrons() for a in original.GetAtoms()))
-                    else:
-                        # Hydrogen-free output uses the default generation vocabulary.
-                        base.encode(text, validate=True)
-
-    def test_radical_at_node_limit_can_terminate_but_not_overbond(self):
-        tokenizer = SnackTokenizer('guacamol', max_nodes=1, node_types=['[CH2]'])
-        self.assertEqual(self.allowed(tokenizer, '[CH2]'), {'[eos]'})
-        for node_first in (False, True):
-            tokenizer = SnackTokenizer('guacamol', max_nodes=2, node_types=['[CH2]', '[C]'],
-                                       node_first=node_first)
-            text = '[CH2][C]1' if node_first else '[CH2]1'
-            self.assertEqual(self.allowed(tokenizer, text), {'-', '='})
+                    self.assertEqual(snack.snack_to_smiles(tokenizer.decode(ids)),
+                                     Chem.MolToSmiles(Chem.MolFromSmiles(smiles)))
+        # Salts need allow_disconnected; a connected tokenizer rejects them.
         with self.assertRaises(ValueError):
-            SnackTokenizer('guacamol', node_types=['[CH5]'])
+            SnackTokenizer(ordering='bfs').encode('Na(+)Cl(-)', validate=True)
+        SnackTokenizer(ordering='bfs', allow_disconnected=True).encode('Na(+)Cl(-)', validate=True)
 
     def test_incremental_and_prefix_masks_agree(self):
-        tokenizer = SnackTokenizer('moses', ordering='bfs')
-        ids = tokenizer.encode('[C]1=[C]2-1-[C]', validate=True)
+        tokenizer = SnackTokenizer(ordering='bfs')
+        ids = tokenizer.encode('C1-C(@)1-N(+)(H)2-C1=(t)C1-O(-)', validate=True)
         state = tokenizer.new_state()
         for i, index in enumerate(ids):
             tokenizer.step(state, index)
             self.assertEqual(tokenizer.allowed_token_ids(state), tokenizer.allowed_next_ids(ids[:i + 1]))
+        with self.assertRaises(ValueError):
+            tokenizer.step(tokenizer.new_state(), tokenizer.token_to_id['C'])
 
-    def test_random_generated_outputs_are_valid(self):
-        for preset in ('graph', 'zinc250k', 'moses', 'guacamol'):
-            for node_first, ascending, disconnected, bfs in itertools.product((False, True), repeat=4):
-                tokenizer = SnackTokenizer(preset, max_nodes=6, node_first=node_first, ascending=ascending,
-                                           allow_disconnected=disconnected, ordering='bfs' if bfs else None)
+    def generate(self, tokenizer, seed, prefer=()):
+        rng = random.Random(seed)
+        state, ids = tokenizer.new_state(), []
+        for _ in range(300):
+            allowed = tokenizer.allowed_token_ids(state)
+            self.assertTrue(allowed, f'Dead end: {tokenizer.decode(ids)}')
+            preferred = [i for i in allowed if tokenizer.tokens[i] in prefer]
+            index = rng.choice(preferred) if preferred and rng.random() < 0.6 else rng.choice(allowed)
+            tokenizer.step(state, index)
+            ids.append(index)
+            if index == tokenizer.eos_id:
+                return tokenizer.decode(ids)
+        self.fail('Generation did not terminate')
+
+    def test_random_generation_is_valid(self):
+        with rdBase.BlockLogs():
+            for preset in ('graph', 'mol'):
+                for node_first, ascending, disconnected, bfs in itertools.product((False, True), repeat=4):
+                    snack.config.set(node_first, ascending)
+                    tokenizer = SnackTokenizer(preset, max_nodes=6, node_first=node_first, ascending=ascending,
+                                               allow_disconnected=disconnected, ordering='bfs' if bfs else None)
+                    for seed in range(8):
+                        with self.subTest(preset=preset, node_first=node_first, ascending=ascending,
+                                          disconnected=disconnected, bfs=bfs, seed=seed):
+                            text = self.generate(tokenizer, seed, prefer=tokenizer.attribute_types)
+                            graph = snack.snack_to_graph(text, strict=False)
+                            self.assertLessEqual(len(graph), 6)
+                            if not disconnected:
+                                self.assertTrue(nx.is_connected(graph))
+                            if preset == 'mol':
+                                # Every generated string decodes and sanitizes.
+                                mol = snack.snack_to_mol(text)
+                                self.assertEqual(mol.GetNumAtoms(), len(graph))
+
+    def test_organic_generation_reparses_as_smiles(self):
+        # With common elements and small charges RDKit can always re-read its own SMILES.
+        with rdBase.BlockLogs():
+            for node_first, ascending in itertools.product((False, True), repeat=2):
                 snack.config.set(node_first, ascending)
-                for seed in range(10):
-                    with self.subTest(preset=preset, node_first=node_first, ascending=ascending,
-                                      disconnected=disconnected, bfs=bfs, seed=seed):
-                        rng = random.Random(seed)
-                        state = tokenizer.new_state()
-                        ids = []
-                        for _ in range(100):
-                            allowed = tokenizer.allowed_token_ids(state)
-                            self.assertTrue(allowed, f'Dead end: {tokenizer.decode(ids)}')
-                            index = rng.choice(allowed)
-                            tokenizer.step(state, index)
-                            ids.append(index)
-                            if index == tokenizer.eos_id:
-                                break
-                        else:
-                            self.fail('Generation did not terminate')
-                        graph = snack.snack_to_graph(tokenizer.decode(ids))
-                        self.assertLessEqual(len(graph), 6)
-                        if not disconnected:
-                            self.assertTrue(nx.is_connected(graph))
-                        if preset != 'graph':
-                            mol = snack.graph_to_mol(graph)
-                            self.assertFalse(any(a.GetNumRadicalElectrons() for a in mol.GetAtoms()))
-                            self.assertIsNotNone(Chem.MolFromSmiles(Chem.MolToSmiles(mol)))
+                tokenizer = SnackTokenizer(max_nodes=8, ordering='bfs', node_first=node_first,
+                                           ascending=ascending, allowed_node_types=ORGANIC)
+                for seed in range(25):
+                    with self.subTest(node_first=node_first, ascending=ascending, seed=seed):
+                        text = self.generate(tokenizer, seed, prefer=('(@)', '(@@)', '(c)', '(t)', '(+)', '(-)'))
+                        smiles = snack.snack_to_smiles(text)
+                        self.assertIsNotNone(Chem.MolFromSmiles(smiles), (text, smiles))
 
     def test_no_training_library_import(self):
         code = '''import importlib.abc, sys
 class Block(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split('.')[0] in {'torch', 'pandas', 'sklearn'}:
+        if fullname.split('.')[0] in {'torch', 'pandas', 'sklearn', 'numpy'}:
             raise ImportError(fullname)
 sys.meta_path.insert(0, Block())
 from snack.tokenizer import SnackTokenizer
-for preset, text in [('graph','v1_v'), ('moses','[C]1-[O]'), ('guacamol','[B]1-[Si]')]:
-    t = SnackTokenizer(preset)
+for preset, text in [('graph', 'o1-o'), ('mol', 'C1-O(-)'), ('mol', 'C1=(t)C'), ('mol', 'Cl1-C(H2)')]:
+    t = SnackTokenizer(preset, ordering='bfs')
     ids = t.encode(text, validate=True)
     assert t.decode(ids) == text
     assert t.get_logit_mask(ids)
@@ -366,7 +475,7 @@ assert not {'torch', 'pandas', 'sklearn'} & sys.modules.keys()
 '''
         result = subprocess.run([sys.executable, '-B', '-c', code],
                                 cwd=Path(snack.__file__).resolve().parent.parent,
-                                capture_output=True, text=True, timeout=60)
+                                capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
 
 

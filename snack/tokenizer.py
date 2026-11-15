@@ -1,7 +1,11 @@
-"""Small SNACK tokenizer and next-token masks; no torch/numpy/pandas imports.
+"""SNACK tokenizer and next-token masks; no torch/numpy/pandas imports.
 
 Masks are vocabulary/logit masks (True = allowed), not transformer attention
-matrices. Molecular presets model simple, kekulized, non-stereochemical graphs.
+matrices. The molecular vocabulary covers every element, the bonds -, = and #,
+and the attribute tokens for isotope, charge, hydrogens, chirality and
+cis/trans. The ranges of the numeric attributes and the default node limit
+cover everything observed in PubChem and ZINC15 (see docs/dataset_scan.md),
+except isotopes, whose range covers the whole periodic table.
 """
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -9,104 +13,126 @@ from numbers import Integral
 
 from snack import graph as _graph
 
-# Conservative organic chemistry domain, including the charged ZINC atom types.
-# Explicit H counts consume valence. Implicit H can fill unused valence;
-# with fixed H counts, RDKit infers radicals from unfilled valence.
-_VALENCES = {
-    ('C', 0): (4,), ('C', -1): (3,), ('N', 0): (3,), ('N', 1): (4,),
-    ('N', -1): (2,), ('O', 0): (2,), ('O', 1): (3,), ('O', -1): (1,),
-    ('P', 0): (3, 5), ('P', 1): (4,), ('S', 0): (2, 4, 6),
-    ('S', 1): (3, 5), ('S', -1): (1, 3, 5),
-    ('F', 0): (1,), ('Cl', 0): (1,), ('Br', 0): (1,), ('I', 0): (1,),
-}
-# GuacaMol includes hypervalent iodine/phosphorus/silicon and additional
-# charged atoms. Keep these extensions separate so existing preset IDs and
-# valence masks do not change. Halide anions are supported as isolated ions.
-_GUACAMOL_VALENCES = {
-    ('B', 0): (3,), ('B', -1): (4,), ('C', 1): (3,),
-    ('F', 1): (2,), ('F', -1): (0,),
-    ('Cl', 1): (2,), ('Cl', 2): (3,), ('Cl', 3): (4,), ('Cl', -1): (0,),
-    ('Br', 2): (3,), ('Br', -1): (0,),
-    ('I', 0): (1, 3, 5), ('I', 1): (2, 4, 6),
-    ('I', 2): (3,), ('I', 3): (4,), ('I', -1): (0,),
-    ('P', -1): (2, 4, 6), ('Si', 0): (4,), ('Si', -1): (3, 5),
-    ('Se', 0): (2, 4, 6), ('Se', 1): (3, 5), ('Se', -1): (1, 3, 5),
-}
-_BASE_ATOMS = {
-    'zinc250k': ('[Br]', '[C-]', '[C]', '[Cl]', '[F]', '[I]', '[N+]', '[N-]',
-                '[N]', '[O+]', '[O-]', '[O]', '[P+]', '[P]', '[S+]', '[S-]', '[S]'),
-    'moses': ('[Br]', '[C]', '[Cl]', '[F]', '[N]', '[O]', '[S]'),
-    'guacamol': ('[B-]', '[B]', '[Br+2]', '[Br-]', '[Br]', '[C+]', '[C-]', '[C]',
-                 '[Cl+2]', '[Cl+3]', '[Cl+]', '[Cl-]', '[Cl]', '[F+]', '[F-]', '[F]',
-                 '[I+2]', '[I+3]', '[I+]', '[I-]', '[I]', '[N+]', '[N-]', '[N]',
-                 '[O+]', '[O-]', '[O]', '[P+]', '[P-]', '[P]', '[S+]', '[S-]', '[S]',
-                 '[Se+]', '[Se-]', '[Se]', '[Si-]', '[Si]'),
-}
-_MAX_NODES = {'graph': 128, 'zinc250k': 38, 'moses': 27, 'guacamol': 88}
+PRESETS = ('graph', 'mol')
+# Defaults derived from the PubChem/ZINC15 scan; every observed value is covered.
+MAX_NODES = {'graph': 128, 'mol': 1024}
+CHARGES = tuple(range(-8, 0)) + tuple(range(1, 9))
+MAX_HYDROGENS = 8
+# One token per mass number, up to the heaviest known nuclide, so every isotope
+# of every element in the vocabulary can be written. Isotope labels are rare
+# (about one molecule in ten thousand in ZINC-22), so a vocabulary fitted to a
+# corpus should narrow this or drop the kind entirely.
+MAX_ISOTOPE = 294
+UNLIMITED = 1 << 16
 _BOND_ORDERS = {'-': 1, '=': 2, '#': 3}
 
 
-@lru_cache(maxsize=None)
-def _atom_spec(token, preset):
-    """(maximum bond-order sum, allowed completed sums) for a basic atom."""
-    from snack.mol import RE_ATOM_TYPE, string_to_atom
-    match = RE_ATOM_TYPE.fullmatch(token[1:-1]) if token.startswith('[') and token.endswith(']') else None
-    if match is None or any(match[key] is not None for key in ('isotope', 'map')):
-        raise ValueError(f'Valence masking only supports simple atom tokens, got {token!r}')
-    atom = string_to_atom(token)
-    key = (atom.GetSymbol(), atom.GetFormalCharge())
-    values = _VALENCES.get(key)
-    if preset == 'guacamol':
-        values = _GUACAMOL_VALENCES.get(key, values)
-    if values is None:
-        raise ValueError(f'No supported valence rule for {token!r}')
-    hydrogens = atom.GetNumExplicitHs()
-    # A fixed H count limits capacity but does not require a closed shell.
-    # For example, [CH2] with one single bond is a valid carbon radical.
-    allowed = frozenset(range(max(values) - hydrogens + 1))
-    if not allowed:
-        raise ValueError(f'Explicit hydrogens exceed the supported valence of {token!r}')
-    return max(allowed), allowed
+def elements():
+    """Every element symbol as a node type, plus the dummy atom *."""
+    from rdkit import Chem
+    table = Chem.GetPeriodicTable()
+    return tuple(table.GetElementSymbol(z) for z in range(1, 119)) + ('*',)
 
 
-def basic_vocabulary(preset='graph', max_nodes=None, max_distance=None):
+def attribute_tokens(attributes=None, *, charges=CHARGES, max_hydrogens=MAX_HYDROGENS,
+                     max_isotope=MAX_ISOTOPE):
+    """Attribute tokens for the selected attribute kinds, in vocabulary order.
+
+    Kinds follow the order in which they are written after a node (isotope,
+    charge, hydrogens, chirality), then the cis/trans bond tokens.
+    """
+    selected = _graph._selected(attributes)
+    values = {
+        'isotope': list(range(1, max_isotope + 1)),
+        'charge': [q for q in sorted(charges) if q],
+        'hydrogens': list(range(max_hydrogens + 1)),
+        'chirality': ['@', '@@'],
+        'cis_trans': ['c', 't'],
+    }
+    return [_graph.attribute_token(key, value) for key in _graph.ATTRIBUTES if key in selected
+            for value in values[key]]
+
+
+def basic_vocabulary(preset='mol', max_nodes=None, max_distance=None, *, attributes=None):
     """Return stable tokens, including [pad], [bos], [eos], for a preset.
 
-    Molecular presets include explicit H variants for use_hydrogens=True
-    output. Complex edge labels require a custom vocabulary and valence=False;
-    no chemistry guarantee applies then.
+    'mol' lists every element, distances, the bonds -, = and # and the
+    attribute tokens; 'graph' lists o, the distances and the plain edge -.
     """
-    if preset not in _MAX_NODES:
-        raise ValueError('preset must be graph, zinc250k, moses, or guacamol')
-    maximum = _MAX_NODES[preset] if max_nodes is None else max_nodes
+    if preset not in PRESETS:
+        raise ValueError(f'preset must be one of {PRESETS}')
+    if attributes is not None and preset == 'graph':
+        raise ValueError('Attributes require the mol preset')
+    maximum = MAX_NODES[preset] if max_nodes is None else max_nodes
     if not isinstance(maximum, Integral) or isinstance(maximum, bool) or maximum < 1:
         raise ValueError('max_nodes must be a positive integer')
     distance = maximum - 1 if max_distance is None else max_distance
     if not isinstance(distance, Integral) or isinstance(distance, bool) or not 0 <= distance < maximum:
         raise ValueError('max_distance must be between 0 and max_nodes - 1')
-    atoms = ['v'] if preset == 'graph' else list(_BASE_ATOMS[preset])
-    if preset != 'graph':
-        from snack.mol import RE_ATOM_TYPE
-        for base in _BASE_ATOMS[preset]:
-            match = RE_ATOM_TYPE.fullmatch(base[1:-1])
-            capacity, _ = _atom_spec(base, preset)
-            for h in range(capacity + 1):
-                atoms.append(f'[{match["element"]}H{h if h != 1 else ""}{match["charge"] or ""}]')
-    distances = [f'{i}_' if preset == 'graph' else str(i) for i in range(1, distance + 1)]
-    return ['[pad]', '[bos]', '[eos]'] + atoms + distances + ([] if preset == 'graph' else list(_BOND_ORDERS))
+    if preset == 'graph':
+        return (['[pad]', '[bos]', '[eos]', _graph.DEFAULT_NODE_TOKEN]
+                + [str(i) for i in range(1, distance + 1)] + [_graph.PLAIN_EDGE])
+    return (['[pad]', '[bos]', '[eos]'] + list(elements()) + [str(i) for i in range(1, distance + 1)]
+            + list(_BOND_ORDERS) + attribute_tokens(attributes))
+
+
+@lru_cache(maxsize=None)
+def capacity(node_type, charge=0, lenient=False):
+    """Largest bond-order sum RDKit accepts for an element with a formal charge.
+
+    None means the charge state is impossible; UNLIMITED means RDKit imposes
+    no valence limit (metals, dummy atoms). By default the atom's hydrogens
+    are inferred, as decoding does for a node without a hydrogens attribute.
+    ``lenient=True`` is the limit RDKit applies to an atom whose H count is
+    given (a node with a hydrogens attribute): bonds and hydrogens count
+    against it, and noble gases are unlimited.
+    """
+    from rdkit import Chem, rdBase
+    from snack.mol import string_to_atom
+    best = None
+    for total in range(0, 13):
+        atom = string_to_atom(node_type)
+        atom.SetFormalCharge(charge)
+        atom.SetNoImplicit(lenient)
+        mol = Chem.RWMol()
+        if lenient:
+            atom.SetNumExplicitHs(total)
+            mol.AddAtom(atom)
+        else:
+            mol.AddAtom(atom)
+            for i in range(total):
+                mol.AddAtom(Chem.Atom(1))
+                mol.AddBond(0, i + 1, Chem.BondType.SINGLE)
+        try:
+            with rdBase.BlockLogs():
+                Chem.SanitizeMol(mol)
+        except (RuntimeError, ValueError):
+            continue
+        best = total
+    return UNLIMITED if best == 12 else best
 
 
 @dataclass
 class _State:
     started: bool = False
     ended: bool = False
-    nodes: list = field(default_factory=list)
-    used: list = field(default_factory=list)
-    edges: list = field(default_factory=list)
-    block: dict = field(default_factory=dict)
-    pending: int | None = None
+    nodes: list = field(default_factory=list)      # node tokens
+    charge: list = field(default_factory=list)     # per node, 0 unless (+q) was given
+    hydrogens: list = field(default_factory=list)  # per node, None unless (Hn) was given
+    used: list = field(default_factory=list)       # bond-order sum per node
+    degree: list = field(default_factory=list)
+    edges: list = field(default_factory=list)      # (node, target, edge)
+    block: dict = field(default_factory=dict)      # targets of the current node's edges
+    pending: int | None = None                     # target awaiting its bond token
     last_distance: int | None = None
     bfs_floor: int = 0
+    last: tuple | None = None                      # ('node', index) | ('edge', (node, target))
+    attribute_rank: int = -1                       # last node attribute written
+
+    def copy(self):
+        return _State(self.started, self.ended, self.nodes[:], self.charge[:], self.hydrogens[:],
+                      self.used[:], self.degree[:], self.edges[:], dict(self.block),
+                      self.pending, self.last_distance, self.bfs_floor, self.last, self.attribute_rank)
 
 
 class SnackTokenizer:
@@ -118,23 +144,24 @@ class SnackTokenizer:
     a new, contiguous component whenever a node has no backward edges.
 
     ``node_first`` and ``ascending`` default to current SNACK settings, captured
-    at construction. ``valence`` defaults to True for molecular presets.
+    at construction. ``valence`` defaults to True for the mol preset: bonds
+    and hydrogens may not exceed the RDKit valence of each atom and
+    charge (a node with a hydrogens attribute gets RDKit's limit for atoms
+    with a given H count, which is unlimited for noble gases), and EOS
+    requires RDKit sanitization to succeed. ``attributes``
+    selects which attribute kinds are in the vocabulary (default: all).
     Optional node_types/edge_types replace the preset vocabulary; optional
-    allowed_node_types/allowed_edge_types restrict generation only.
-
-    Preset valence masks default to implicit-H atom types. Explicit-H variants
-    stay in the vocabulary for encoding; opt into generating them via
-    allowed_node_types. Custom restrictions can lead to an empty mask:
-    backtrack or restart rather than emitting an invalid EOS. Every permitted
-    molecular EOS passes RDKit sanitization, which also infers radical counts.
+    allowed_node_types/allowed_edge_types restrict generation only. Chirality
+    and cis/trans tokens are permitted wherever the structure might support
+    them; decoding drops the ones that are not stereogenic.
     """
-    def __init__(self, preset='graph', *, max_nodes=None, max_distance=None,
+    def __init__(self, preset='mol', *, max_nodes=None, max_distance=None,
                  ordering=None, allow_disconnected=False, node_first=None, ascending=None,
-                 valence=None, node_types=None, edge_types=None,
+                 valence=None, node_types=None, edge_types=None, attributes=None,
                  allowed_node_types=None, allowed_edge_types=None):
-        base = basic_vocabulary(preset, max_nodes, max_distance)
+        base = basic_vocabulary(preset, max_nodes, max_distance, attributes=attributes)
         self.preset = preset
-        self.max_nodes = _MAX_NODES[preset] if max_nodes is None else int(max_nodes)
+        self.max_nodes = MAX_NODES[preset] if max_nodes is None else int(max_nodes)
         self.max_distance = self.max_nodes - 1 if max_distance is None else int(max_distance)
         if ordering not in (None, 'bfs'):
             raise ValueError('Only ordering=None or ordering="bfs" has a generation mask')
@@ -145,7 +172,7 @@ class SnackTokenizer:
         self.molecular = preset != 'graph'
         self.valence = self.molecular if valence is None else valence
         if self.valence and not self.molecular:
-            raise ValueError('Valence masks require a molecular preset')
+            raise ValueError('Valence masks require the mol preset')
         self.node_types = tuple(node_types) if node_types is not None else tuple(
             token for token in base[3:] if _graph.token_type(token) == 'node_type')
         self.edge_types = tuple(edge_types) if edge_types is not None else tuple(
@@ -153,27 +180,43 @@ class SnackTokenizer:
         if not self.node_types or any(_graph.token_type(token) != 'node_type' for token in self.node_types):
             raise ValueError('node_types must contain valid SNACK node tokens')
         if any(_graph.token_type(token) != 'edge_type' for token in self.edge_types):
-            raise ValueError('edge_types must contain serialized edge tokens, e.g. (contact)')
-        if (not self.molecular and self.edge_types) or (self.molecular and not self.edge_types):
-            raise ValueError('Graph mode uses untyped edges; molecular mode requires edge types')
+            raise ValueError('edge_types must contain -, = or #')
+        if not self.edge_types:
+            raise ValueError('Every edge needs a type token: - = or #')
+        if not self.molecular and self.edge_types != (_graph.PLAIN_EDGE,):
+            raise ValueError(f'Graph mode uses the plain edge {_graph.PLAIN_EDGE} alone')
         distances = [token for token in base if _graph.token_type(token) == 'distance']
-        self.tokens = tuple(base[:3]) + self.node_types + tuple(distances) + self.edge_types
+        self.attribute_types = tuple(token for token in base if _graph.token_type(token) == 'attribute')
+        self.tokens = (tuple(base[:3]) + self.node_types + tuple(distances) + self.edge_types
+                       + self.attribute_types)
         if len(set(self.tokens)) != len(self.tokens):
             raise ValueError('Vocabulary must not contain duplicate or reserved tokens')
         self.token_to_id = {token: i for i, token in enumerate(self.tokens)}
         self.pad_id, self.bos_id, self.eos_id = range(3)
-        # Default generation uses implicit-H atoms. H variants remain in the
-        # vocabulary for encoding; opt into their generation via allowed_node_types.
-        if allowed_node_types is None and node_types is None and self.valence:
-            allowed_node_types = _BASE_ATOMS[preset]
         self._nodes = self._restrict(self.node_types, allowed_node_types, 'node')
         self._edges = self._restrict(self.edge_types, allowed_edge_types, 'edge')
-        self._specs = {token: _atom_spec(token, preset) for token in self._nodes} if self.valence else {}
-        if self.valence and any(edge not in _BOND_ORDERS for edge in self._edges):
-            raise ValueError('Valence masking supports only -, =, #; use kekulized molecules')
+        if self.valence:
+            from snack.mol import _element
+            for token in self._nodes:
+                _element(token)
+            if any(edge not in _BOND_ORDERS for edge in self._edges):
+                raise ValueError('Valence masking supports only -, = and #')
         self._node_ids = [self.token_to_id[token] for token in self._nodes]
         self._edge_ids = [self.token_to_id[token] for token in self._edges]
         self._distance_ids = [self.token_to_id[token] for token in distances]
+        # Parsed attribute tokens grouped by kind: {kind: [(id, value), ...]}.
+        self._attributes = {}
+        for token in self.attribute_types:
+            key, value = _graph.parse_attribute(token)
+            self._attributes.setdefault(key, []).append((self.token_to_id[token], value))
+        self._charges = (0,) + tuple(value for _, value in self._attributes.get('charge', ()))
+        # Nodes may take RDKit's limit for a given H count once a hydrogens token is written.
+        self._lenient = self.valence and 'hydrogens' in self._attributes
+        # Capacity over every charge in the vocabulary, per allowed node type, and the
+        # most permissive one, for edges written before their node.
+        self._capacities = {token: self._max_capacity(token) if self.valence else UNLIMITED
+                            for token in self._nodes}
+        self._max_node_capacity = max(self._capacities.values(), default=0)
 
     @staticmethod
     def _restrict(vocabulary, allowed, kind):
@@ -233,6 +276,50 @@ class SnackTokenizer:
     def new_state(self):
         return _State()
 
+    # ----- valence bookkeeping -------------------------------------------------
+    def _max_capacity(self, token):
+        """Capacity over every charge in the vocabulary and H convention (0 when none is possible)."""
+        modes = (False, True) if self._lenient else (False,)
+        return max((capacity(token, q, lenient) or 0 for q in self._charges for lenient in modes
+                    if capacity(token, q, lenient) is not None), default=0)
+
+    def _remaining(self, state, index, charge=None, lenient=None):
+        """Bond-order capacity left on a node, for its written (or given) charge.
+
+        ``lenient`` selects RDKit's convention for atoms with a given H count;
+        by default it follows whether the node carries a hydrogens attribute.
+        """
+        if not self.valence:
+            return UNLIMITED
+        charge = state.charge[index] if charge is None else charge
+        if lenient is None:
+            lenient = state.hydrogens[index] is not None
+        limit = capacity(state.nodes[index], charge, lenient)
+        if limit is None:
+            return -1
+        return limit - (state.hydrogens[index] or 0) - state.used[index]
+
+    def _hydrogens_pending(self, state, index):
+        """Whether the current node can still receive a hydrogens token."""
+        return (self._lenient and state.hydrogens[index] is None
+                and state.attribute_rank < _graph._ATTRIBUTE_RANK['hydrogens'])
+
+    def _room(self, state, index, charge=None):
+        """Capacity the current node can still reach: as written, or after a hydrogens token."""
+        best = self._remaining(state, index, charge)
+        if self._hydrogens_pending(state, index):
+            best = max(best, self._remaining(state, index, charge, lenient=True))
+        return best
+
+    def _node_complete(self, state):
+        """Whether the most recent node is valid as written (no attribute still required)."""
+        return not state.nodes or not self.valence or self._remaining(state, len(state.nodes) - 1) >= 0
+
+    def _fixable(self, state, index):
+        """Charges in the vocabulary after which node ``index`` can still become valid."""
+        return [q for q in self._charges if self._room(state, index, q) >= 0]
+
+    # ----- structural helpers ---------------------------------------------------
     def _current(self, state):
         return len(state.nodes) - int(self.node_first)
 
@@ -245,45 +332,59 @@ class SnackTokenizer:
         state.block.clear()
         state.last_distance = None
 
-    def _capacity(self, state, target):
-        return self._specs[state.nodes[target]][0] - state.used[target]
+    def _bond_options(self, state, target, room=None):
+        """Bond tokens allowed between the current node and target.
 
-    def _bond_options(self, state, target):
+        ``room`` is the current node's spare capacity, when known.
+        """
         if not self.molecular:
-            return ('',)
+            return (_graph.PLAIN_EDGE,)
         if not self.valence:
             return self._edges
-        current = self._current(state)
-        used = sum(_BOND_ORDERS[edge] for edge in state.block.values())
-        capacity = (self._capacity(state, current) if self.node_first else
-                    max(self._specs[node][0] for node in self._nodes) - used)
-        return tuple(edge for edge in self._edges
-                     if _BOND_ORDERS[edge] <= min(capacity, self._capacity(state, target)))
+        if room is None:
+            room = self._current_room(state)
+        room = min(room, self._remaining(state, target))
+        return tuple(edge for edge in self._edges if _BOND_ORDERS[edge] <= room)
 
-    def _distance_ok(self, state, distance):
+    def _current_room(self, state):
+        if self.node_first:
+            return self._remaining(state, self._current(state))
+        return self._max_node_capacity - sum(_BOND_ORDERS[edge] for edge in state.block.values())
+
+    def _distance_candidates(self, state):
         current = self._current(state)
         if current < 1 or (not self.node_first and len(state.nodes) >= self.max_nodes):
-            return False
-        target = current - distance
-        if target < 0 or target in state.block:
-            return False
-        if state.last_distance is not None:
-            if (distance <= state.last_distance if self.ascending else distance >= state.last_distance):
-                return False
-        if self.ordering == 'bfs' and target < state.bfs_floor:
-            return False
-        return bool(self._bond_options(state, target))
+            return []
+        if not self._node_complete(state):
+            return []
+        room = self._current_room(state) if self.valence else UNLIMITED
+        floor = state.bfs_floor if self.ordering == 'bfs' else 0
+        allowed = []
+        for distance in range(1, min(current - floor, self.max_distance) + 1):
+            target = current - distance
+            if target in state.block:
+                continue
+            if state.last_distance is not None and (
+                    distance <= state.last_distance if self.ascending else distance >= state.last_distance):
+                continue
+            if self._bond_options(state, target, room):
+                allowed.append(self._distance_ids[distance - 1])
+        return allowed
 
     def _chemical_end(self, state):
         if not self.valence:
             return True
-        if any(used not in self._specs[node][1] for node, used in zip(state.nodes, state.used)):
-            return False
         import networkx as nx
         from rdkit import rdBase
         from snack.mol import graph_to_mol
         graph = nx.Graph()
-        graph.add_nodes_from((i, {'node_type': token}) for i, token in enumerate(state.nodes))
+        for i, token in enumerate(state.nodes):
+            data = {'node_type': token}
+            if state.charge[i]:
+                data['charge'] = state.charge[i]
+            if state.hydrogens[i] is not None:
+                data['hydrogens'] = state.hydrogens[i]
+            graph.add_node(i, **data)
         graph.add_edges_from((u, v, {'edge_type': edge}) for u, v, edge in state.edges)
         with rdBase.BlockLogs():
             try:
@@ -293,7 +394,7 @@ class SnackTokenizer:
         return True
 
     def _can_end(self, state):
-        if not state.nodes or state.pending is not None:
+        if not state.nodes or state.pending is not None or not self._node_complete(state):
             return False
         if self.node_first:
             if not self._block_ok(state):
@@ -302,44 +403,92 @@ class SnackTokenizer:
             return False
         return self._chemical_end(state)
 
-    def _node_ok(self, state, token):
+    def _node_candidates(self, state):
         if len(state.nodes) >= self.max_nodes or state.pending is not None:
-            return False
+            return []
+        if not self._node_complete(state):
+            return []
         if self.node_first:
             if state.nodes and not self._block_ok(state):
-                return False
+                return []
+            if not state.nodes or self.allow_disconnected:
+                return list(self._node_ids)
             # Do not start a connected node if it cannot attach to any predecessor.
-            if state.nodes and not self.allow_disconnected:
-                floor = (min(state.block) if state.block else len(state.nodes) - 1) if self.ordering == 'bfs' else 0
-                targets = range(max(floor, len(state.nodes) - self.max_distance), len(state.nodes))
-                if not any(not self.valence or any(_BOND_ORDERS[e] <= min(
-                    self._specs[token][0], self._capacity(state, t)) for e in self._edges) for t in targets):
-                    return False
-            return True
+            floor = (min(state.block) if state.block else len(state.nodes) - 1) if self.ordering == 'bfs' else 0
+            targets = range(max(floor, len(state.nodes) - self.max_distance), len(state.nodes))
+            if not any(self._remaining(state, t) >= 1 for t in targets):
+                return []
+            return [index for index in self._node_ids if self._capacities[self.tokens[index]] >= 1]
         if not self._block_ok(state):
-            return False
-        if self.valence:
-            used = sum(_BOND_ORDERS[edge] for edge in state.block.values())
-            if used > self._specs[token][0]:
-                return False
-            if len(state.nodes) + 1 == self.max_nodes:
-                trial = self._copy(state)
-                self._consume(trial, self.token_to_id[token])
-                return self._can_end(trial)
-        return True
+            return []
+        if not self.valence:
+            return list(self._node_ids)
+        used = sum(_BOND_ORDERS[edge] for edge in state.block.values())
+        final = len(state.nodes) + 1 == self.max_nodes
+        allowed = []
+        for index in self._node_ids:
+            if self._capacities[self.tokens[index]] < used:
+                continue
+            if final and not self._final_node_ok(state, index):
+                continue
+            allowed.append(index)
+        return allowed
 
-    @staticmethod
-    def _copy(state):
-        return _State(state.started, state.ended, state.nodes[:], state.used[:],
-                      state.edges[:], dict(state.block), state.pending,
-                      state.last_distance, state.bfs_floor)
+    def _final_node_ok(self, state, index):
+        """Whether the last permitted node can still finish, possibly after a charge token."""
+        trial = state.copy()
+        self._consume(trial, index)
+        fixes = self._fixable(trial, len(trial.nodes) - 1)
+        if not fixes:
+            return False
+        trial.charge[-1] = 0 if 0 in fixes else fixes[0]
+        if self._remaining(trial, len(trial.nodes) - 1) < 0:
+            trial.hydrogens[-1] = 0   # valid only under the given-H convention
+        return self._can_end(trial)
+
+    def _attribute_ids(self, state):
+        """Attribute tokens that may directly follow the node or edge just completed."""
+        if state.last is None:
+            return []
+        kind, key = state.last
+        if kind == 'edge':
+            node, target = key
+            return ([index for index, _ in self._attributes.get('cis_trans', ())]
+                    if state.block.get(target) == '=' else [])
+        index = key
+        allowed = []
+        for rank, name in enumerate(_graph.NODE_ATTRIBUTES):
+            if rank <= state.attribute_rank:
+                continue
+            for token_id, value in self._attributes.get(name, ()):
+                if self._attribute_ok(state, index, name, value):
+                    allowed.append(token_id)
+        return allowed
+
+    def _attribute_ok(self, state, index, name, value):
+        if name == 'isotope':
+            return True        # a mass number constrains nothing about bonding
+        if not self.valence:
+            return True
+        # A node-first node that still needs its backward edge must keep room for it.
+        floor = int(self.node_first and index > 0 and not state.block and not self.allow_disconnected)
+        if name == 'charge':
+            return self._room(state, index, value) >= floor
+        if name == 'hydrogens':
+            return self._remaining(state, index, lenient=True) - value >= floor
+        if name == 'chirality':
+            # The last attribute: the node must already be valid as written.
+            neutral = capacity(state.nodes[index], 0)
+            return (state.degree[index] <= 4 and (neutral is None or neutral >= 3)
+                    and self._remaining(state, index) >= floor)
+        raise ValueError(name)
 
     def allowed_token_ids(self, state):
         """Allowed IDs for an incremental state. An empty result is a dead end.
 
         At max_nodes no further node is allowed. Edge-first then permits only
-        valid EOS. Node-first may finish the final node's backward edges before
-        EOS; stopping immediately on that node token would omit its bonds.
+        attributes of the final node and a valid EOS. Node-first may finish the
+        final node's backward edges before EOS.
         """
         if not state.started:
             return [self.bos_id]
@@ -347,9 +496,8 @@ class SnackTokenizer:
             return [self.pad_id]
         if state.pending is not None:
             return [self.token_to_id[edge] for edge in self._bond_options(state, state.pending)]
-        allowed = [index for index in self._node_ids if self._node_ok(state, self.tokens[index])]
-        allowed += [index for index in self._distance_ids
-                    if self._distance_ok(state, int(self.tokens[index].rstrip('_')))]
+        allowed = self._node_candidates(state) + self._distance_candidates(state)
+        allowed += self._attribute_ids(state)
         if self._can_end(state):
             allowed.append(self.eos_id)
         return allowed
@@ -358,14 +506,16 @@ class SnackTokenizer:
         current = self._current(state)
         state.edges.append((current, target, edge))
         state.block[target] = edge
-        if self.valence:
-            order = _BOND_ORDERS[edge]
-            state.used[target] += order
-            if self.node_first:
-                state.used[current] += order
+        state.degree[target] += 1
+        state.used[target] += _BOND_ORDERS.get(edge, 0)
+        if self.node_first:
+            state.degree[current] += 1
+            state.used[current] += _BOND_ORDERS.get(edge, 0)
+        state.last = ('edge', (current, target))
 
     def _consume(self, state, index):
         token = self.tokens[index]
+        state.last = None
         if index == self.bos_id:
             state.started = True
         elif index == self.eos_id:
@@ -376,25 +526,41 @@ class SnackTokenizer:
             if self.node_first:
                 if state.nodes:
                     self._finish_block(state)
-                state.nodes.append(token)
-                state.used.append(0)
+                used, degree = 0, 0
             else:
-                used = sum(_BOND_ORDERS[e] for e in state.block.values()) if self.valence else 0
+                used = sum(_BOND_ORDERS.get(e, 0) for e in state.block.values())
+                degree = len(state.block)
                 # Finish while the new node's index is still len(nodes).
                 self._finish_block(state)
-                state.nodes.append(token)
-                state.used.append(used)
+            state.nodes.append(token)
+            state.charge.append(0)
+            state.hydrogens.append(None)
+            state.used.append(used)
+            state.degree.append(degree)
+            state.attribute_rank = -1
+            state.last = ('node', len(state.nodes) - 1)
+        elif token in self.attribute_types:
+            key, value = _graph.parse_attribute(token)
+            if key == 'cis_trans':
+                return
+            current = len(state.nodes) - 1
+            if key == 'hydrogens':
+                state.hydrogens[current] = value
+            elif key == 'charge':
+                state.charge[current] = value
+            # chirality and isotope constrain no later token, so carry no state
+            # beyond the attribute rank below.
+            state.attribute_rank = _graph._ATTRIBUTE_RANK[key]
+            state.last = ('node', current)
         elif token in self.edge_types:
             self._add_edge(state, state.pending, token)
             state.pending = None
         else:
-            distance = int(token.rstrip('_'))
+            distance = int(token)
             state.last_distance = distance
-            target = self._current(state) - distance
-            if self.molecular:
-                state.pending = target
-            else:
-                self._add_edge(state, target, '')
+            # Both presets write the type after the distance, so the edge is
+            # only complete once that token arrives.
+            state.pending = self._current(state) - distance
 
     def step(self, state, token_id):
         """Consume one allowed token in place; reject invalid prefixes immediately."""

@@ -9,3 +9,6 @@ venv/
 .coverage
 htmlcov/
 .DS_Store
+
+# Local dataset copies and scan outputs
+datasets

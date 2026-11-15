@@ -1,4 +1,4 @@
-# SNACK
+# SNACK-mol
 
 > **SNACK: A Sequential Notation Framework for Probabilistic Graph Generation**
 
@@ -15,130 +15,76 @@ Neural Information Processing Systems (NeurIPS), 2026
    <img src="image/snack_fig.png" alt="SNACK encoding process" width="650px">
 </p>
 
-`snack` is a compact string representation for discrete graphs, with helper
-utilities to convert between:
+`snack-mol` is a fork of [`snack-graph`](https://github.com/leelabsg/snack) that
+extends the SNACK string notation to the full range of molecules found in
+PubChem and ZINC: charges, hydrogen counts, chirality and cis/trans double
+bonds, with a single general vocabulary. It converts between
 
+- **SMILES / RDKit molecules** ↔ **SNACK strings**
 - **NetworkX graphs** ↔ **SNACK strings**
-- **SMILES / RDKit molecules** ↔ **SNACK strings** (molecular graphs)
 
-Dependencies: `networkx`, `pynauty`, and `rdkit`. The tokenizer and dataset
-loader do not require PyTorch or pandas.
+Dependencies: `networkx`, `pynauty`, and `rdkit`. The tokenizer does not
+require PyTorch, NumPy or pandas.
 
 ## Installation
 
 ```bash
-pip install snack-graph
+pip install snack-mol
 ```
+
+## Notation
+
+A SNACK string lists nodes in a chosen order. Each node is preceded (edge-first,
+the default) or followed (node-first) by its edges to earlier nodes, written as
+the *distance* back to the neighbor followed by the bond type:
+
+```text
+C1-C1-O        CCO        C1=C1-C1=C1-C5-1=C   benzene
+```
+
+| Element | Spelling | Notes |
+| --- | --- | --- |
+| Atom | `C`, `Cl`, `Fe`, `*` | Element symbol, no brackets; every element is supported. |
+| Node | `o` | A node with no type, for generic graphs. |
+| Distance | `1`, `2`, ... | Number of nodes back to the neighbor. |
+| Bond | `-`, `=`, `#` | Molecules are always kekulized; there is no aromatic bond token. `-` is also the plain edge of a generic graph. |
+| Isotope | `(2)`, `(13)`, `(235)`, ... | After the atom, before the others. The bare mass number: `C(13)` is carbon-13. |
+| Charge | `(+)`, `(-)`, `(+2)`, `(-3)`, ... | After the atom. `+2` rather than `++`. |
+| Hydrogens | `(H0)`, `(H)`, `(H2)`, ... | After the atom. Written only when the count cannot be inferred: `C` is `C(H4)`. |
+| Chirality | `(@)`, `(@@)` | After the atom. SMILES meaning with neighbors ordered by node index. |
+| Cis/trans | `(c)`, `(t)` | After a `=` bond. Local cis/trans of the lowest-index substituents. |
+| Anything else | `(weight=3)`, `(node_type=hub)` | One token per node or edge data entry, sorted by name, after the attributes above. |
+
+Atom attributes are written in the fixed order isotope → charge → hydrogens →
+chirality, each at most once, so `N(15)(+)(H)(@)` is valid and `N(@)(+)` is
+not; the mass number comes first, as it does in a SMILES bracket atom.
+Radicals are not written: an atom with fewer hydrogens than its valence allows
+carries its hydrogen count instead (`[CH2]C` is `C(H2)1-C`), and RDKit restores
+the unpaired electrons on decoding. Atom map numbers are not supported.
 
 ## Usage
 
 | Function | Purpose |
 | --- | --- |
-| `graph_to_snack()` / `snack_to_graph()` | Convert between NetworkX graphs and SNACK strings. |
 | `smiles_to_snack()` / `snack_to_smiles()` | Convert between SMILES and SNACK strings. |
 | `mol_to_snack()` / `snack_to_mol()` | Convert between RDKit molecules and SNACK strings. |
 | `smiles_to_graph()` / `graph_to_smiles()` | Convert between SMILES and NetworkX graphs. |
 | `mol_to_graph()` / `graph_to_mol()` | Convert between RDKit molecules and NetworkX graphs. |
+| `graph_to_snack()` / `snack_to_graph()` | Convert between NetworkX graphs and SNACK strings. |
 | `graph_to_tokens()` / `tokens_to_graph()` | Convert between NetworkX graphs and lists of SNACK tokens. |
-| `split()` | Split a SNACK string into tokens, distance–edge pairs, or node blocks. |
-| `filter()` | Extract node types, edge types, or distances from a SNACK string. |
-| `SnackTokenizer()` | Create a tokenizer using the `graph`, `zinc250k`, `moses`, or `guacamol` preset. |
+| `split()` | Split a SNACK string into tokens, distance–bond pairs, or node blocks. |
+| `filter()` | Extract node, distance, bond or attribute tokens from a SNACK string. |
+| `is_canonical_snack()` | Check that every stereo mark and hydrogen count in a string is necessary. |
+| `SnackTokenizer()` | Create the general molecular tokenizer (or the `graph` preset). |
 | `tokenizer.encode()` / `tokenizer.decode()` | Convert between SNACK strings and integer token IDs. |
 | `tokenizer.get_logit_mask()` | Return an allowed-next-token mask after each token in a sequence. |
-| `load_dataset()` | Load a bundled dataset as a dictionary of `train`, `val`, and `test` SNACK-string lists. |
-| `count_automorphisms()` | Count graph symmetries while respecting node types, edge types, and weights. |
+| `count_automorphisms()` | Count graph symmetries while respecting atom attributes and stereo. |
 | `canonicalize_smiles()` / `randomize_smiles()` | Produce canonical SMILES or an alternative SMILES for the same molecule. |
-
-
+| `load_dataset()` | Load a bundled generic-graph dataset as `train`, `val`, and `test` SNACK-string lists. |
 
 ## Examples
 
-### 1) NetworkX graph → SNACK → graph
-
-SNACK specifies node types in brackets (e.g., [node_type]).
-
-```python
-import random
-import networkx as nx
-import snack as snk
-
-random.seed(0)
-G = nx.Graph()
-G.add_node(0, node_type="[A]")
-G.add_node(1, node_type="[B]")
-G.add_node(2, node_type="[C]")
-G.add_edge(0, 1, edge_type="-")
-G.add_edge(1, 2, edge_type="=")
-
-sn = snk.graph_to_snack(G, ordering="uniform")
-G2 = snk.snack_to_graph(sn)
-
-print(sn)
-print(G2.nodes(data=True))
-print(G2.edges(data=True))
-```
-
-```text
-[A][C]2-1=[B]
-[(0, {'node_type': '[A]'}), (1, {'node_type': '[C]'}), (2, {'node_type': '[B]'})]
-[(0, 2, {'edge_type': '-'}), (1, 2, {'edge_type': '='})]
-```
-
-### 2) Non-attributed graphs
-
-`v` denotes a node. `_` denotes an untyped edge (used to separate consecutive distances).
-
-```python
-import networkx as nx
-import snack as snk
-
-G = nx.Graph()
-G.add_edge(0, 1)
-G.add_edge(0, 2)
-G.add_edge(2, 3)
-G.add_edge(2, 4)
-
-sn = snk.graph_to_snack(G)
-tokens = snk.split(sn, pattern="token")
-
-print(sn)
-print(tokens)
-```
-
-```text
-v1_v2_v1_v2_v
-['v', '1_', 'v', '2_', 'v', '1_', 'v', '2_', 'v']
-```
-
-
-### 3) Weighted graphs and complex edge types
-
-Complex edge types use parentheses. Use `attributed=False` to retain
-only connectivity.
-
-```python
-import networkx as nx
-import snack as snk
-
-G = nx.Graph()
-G.add_edge(0, 1, weight=3)
-sn = snk.graph_to_snack(G)
-print("weighted:", sn)
-print("decoded edge:", snk.snack_to_graph(sn).edges[0, 1])
-
-G.edges[0, 1]["edge_type"] = "contact"
-print("type and weight:", snk.graph_to_snack(G))
-print("connectivity only:", snk.graph_to_snack(G, attributed=False))
-```
-
-```text
-weighted: v1(weight=3)v
-decoded edge: {'weight': 3}
-type and weight: v1(type=contact;weight=3)v
-connectivity only: v1_v
-```
-
-### 4) SMILES → SNACK → SMILES (round-trip)
+### 1) SMILES → SNACK → SMILES
 
 `smiles_to_snack()` uses randomized BFS by default. Set a random seed for
 reproducible sequences, or use `ordering=None` to preserve input atom order.
@@ -148,134 +94,128 @@ import random
 import snack as snk
 
 random.seed(0)
-smiles = "CCO"  # ethanol
-sn = snk.smiles_to_snack(smiles, ordering="bfs")
-smiles_rt = snk.snack_to_smiles(sn, canonical=True)
+smiles = "CC(=O)Oc1ccccc1C(=O)O"  # aspirin
+sn = snk.smiles_to_snack(smiles)
 
 print("snack:", sn)
-print("canonical smiles:", smiles_rt)
+print("smiles:", snk.snack_to_smiles(sn))
 ```
 
 ```text
-snack: [C]1-[O]2-[C]
-canonical smiles: CCO
+snack: C1=C2-C2-C2=C2=1-C2-O2-C2-C2=O3-O3=O4-C
+smiles: CC(=O)Oc1ccccc1C(=O)O
 ```
 
-### 5) RDKit molecule ↔ NetworkX graph ↔ SNACK
+### 2) Charges, hydrogen counts and stereochemistry
 
-```python
-from rdkit import Chem
-import snack as snk
-
-mol = Chem.MolFromSmiles("CCO")
-G = snk.mol_to_graph(mol)
-sn = snk.mol_to_snack(mol)
-
-print("snack:", sn)
-print("from graph:", snk.graph_to_smiles(G))
-print("from snack:", Chem.MolToSmiles(snk.snack_to_mol(sn)))
-```
-
-```text
-snack: [C]1-[C]1-[O]
-from graph: CCO
-from snack: CCO
-```
-
-`smiles_to_graph()` accepts SMILES directly; `graph_to_mol()` returns an RDKit
-molecule. Molecular conversion preserves isotopes and atom maps but omits all
-stereochemistry. Dative bonds, invalid valence, and unsupported molecular tokens
-raise `ValueError`. Connectivity-only graphs cannot be decoded as molecules.
-
-### 6) Hydrogen counts and molecular conversion options
-
-With `use_hydrogens=True`, every atom includes its hydrogen count, including
-`H0` for zero hydrogens. These counts can distinguish a radical from a molecule
-whose remaining valence is filled by implicit hydrogens:
+Every attribute is kept by default, so decoding returns the input molecule.
 
 ```python
 import snack as snk
 
-with_h = snk.smiles_to_snack("[CH3]", use_hydrogens=True)
-without_h = snk.smiles_to_snack("[CH3]", use_hydrogens=False)
-
-print("with H counts:", with_h, "->", snk.snack_to_smiles(with_h))
-print("without H counts:", without_h, "->", snk.snack_to_smiles(without_h))
+for smiles in ["C[C@H](N)C(=O)O", "F/C=C/F", "C[N+](C)(C)C", "[CH2]C", "C[O]", "O=[PH3]", "[O-][n+]1ccccc1", "F[Kr]F"]:
+    sn = snk.smiles_to_snack(smiles, ordering=None)
+    print(f"{smiles:18} {sn:32} {snk.snack_to_smiles(sn)}")
 ```
 
 ```text
-with H counts: [CH3] -> [CH3]
-without H counts: [C] -> C
+C[C@H](N)C(=O)O    C1-C(@)1-N2-C1=O2-O              C[C@H](N)C(=O)O
+F/C=C/F            F1-C1=(t)C1-F                    F/C=C/F
+C[N+](C)(C)C       C1-N(+)1-C2-C3-C                 C[N+](C)(C)C
+[CH2]C             C(H2)1-C                         [CH2]C
+C[O]               C1-O(H0)                         C[O]
+O=[PH3]            O1=P(H3)                         O=[PH3]
+[O-][n+]1ccccc1    O(-)1-N(+)1=C1-C1=C1-C5-1=C      [O-][n+]1ccccc1
+F[Kr]F             F1-Kr(H0)1-F                     F[Kr]F
 ```
 
-Hydrogen counts are omitted by default; separate hydrogen nodes remain in the
-graph. `use_charge=True` preserves formal charges, and `kekulize=True` expresses
-aromatic bonds using single and double bonds. Omitting hydrogen counts or
-charges can change molecular identity or prevent decoding.
+Hydrogen counts are implied by the element, bonds and charge (RDKit's valence
+model), so `(H...)` appears only where that inference gives a different
+count: fewer hydrogens than inferred means a radical (`C(H2)`), more means a
+hypervalent atom (`P(H3)`). It also appears where RDKit would reject the
+atom unless its H count is given, as in `Kr(H0)`.
 
-### 7) Splitting SNACK: `split`
+### 3) Choosing which attributes to keep
+
+`attributes` selects any subset of `isotope`, `charge`, `hydrogens`,
+`chirality` and `cis_trans`. Dropping any of them changes the molecule that is
+decoded.
 
 ```python
-import random
 import snack as snk
 
-random.seed(0)
-sn = snk.smiles_to_snack("c1ccccc1", ordering="cm", kekulize=False)  # benzene
-
-tokens = snk.split(sn, pattern="token")
-elements = snk.split(sn, pattern="graph")
-blocks = snk.split(sn, pattern="block")
-
-print("tokens:", tokens)
-print("graph elements:", elements)
-print("blocks:", blocks)
+smiles = "C[13C@H]([NH3+])C(=O)[O-]"
+for attributes in (None, ("isotope",), ("charge", "hydrogens"), ()):
+    sn = snk.smiles_to_snack(smiles, ordering=None, attributes=attributes)
+    print(f"{str(attributes):26} {sn:44} {snk.snack_to_smiles(sn)}")
 ```
 
 ```text
-tokens: ['[C]', '1', 'a', '[C]', '2', 'a', '[C]', '2', 'a', '[C]', '2', 'a', '[C]', '2', 'a', '1', 'a', '[C]']
-graph elements: ['[C]', '1a', '[C]', '2a', '[C]', '2a', '[C]', '2a', '[C]', '2a', '1a', '[C]']
-blocks: ['[C]', '1a[C]', '2a[C]', '2a[C]', '2a[C]', '2a1a[C]']
+None                       C1-C(13)(@)1-N(+)2-C1=O2-O(-)                C[13C@H]([NH3+])C(=O)[O-]
+('isotope',)               C1-C(13)1-N2-C1=O2-O                         C[13CH](N)C(=O)O
+('charge', 'hydrogens')    C1-C1-N(+)2-C1=O2-O(-)                       CC([NH3+])C(=O)[O-]
+()                         C1-C1-N2-C1=O2-O                             CC(N)C(=O)O
 ```
 
-### 8) Token-level operations: `filter` and `token_type`
+### 4) Molecules as NetworkX graphs
+
+Graphs store the attributes under the same names. `attributed=False`
+keeps only connectivity.
 
 ```python
-import random
 import snack as snk
 
-random.seed(0)
-sn = snk.smiles_to_snack("c1ccccc1", ordering="bfs", kekulize=False)  # benzene
-
-tokens = snk.split(sn, pattern="token")
-node_tokens = snk.filter(sn, key="node_type")
-edge_tokens = snk.filter(sn, key="edge_type")
-dist_tokens = snk.filter(sn, key="distance")
-
-print("num tokens:", len(tokens))
-print("first 10:", tokens[:10])
-print("node_type tokens:", node_tokens[:5])
-print("edge_type tokens:", edge_tokens[:5])
-print("distance tokens:", dist_tokens)
-print("types:", [snk.token_type(t) for t in tokens[:10]])
+G = snk.smiles_to_graph("C[N+](C)(C)C")
+print(G.nodes(data=True))
+print(G.edges(data=True))
+print(snk.graph_to_snack(G))
+print(snk.graph_to_snack(G, attributed=False))
 ```
 
 ```text
-num tokens: 18
-first 10: ['[C]', '1', 'a', '[C]', '2', 'a', '[C]', '2', 'a', '[C]']
-node_type tokens: ['[C]', '[C]', '[C]', '[C]', '[C]']
-edge_type tokens: ['a', 'a', 'a', 'a', 'a']
-distance tokens: ['1', '2', '2', '2', '2', '1']
-types: ['node_type', 'distance', 'edge_type', 'node_type', 'distance', 'edge_type', 'node_type', 'distance', 'edge_type', 'node_type']
+[(0, {'node_type': 'C'}), (1, {'node_type': 'N', 'charge': 1}), (2, {'node_type': 'C'}), (3, {'node_type': 'C'}), (4, {'node_type': 'C'})]
+[(0, 1, {'edge_type': '-'}), (1, 2, {'edge_type': '-'}), (1, 3, {'edge_type': '-'}), (1, 4, {'edge_type': '-'})]
+C1-N(+)1-C2-C3-C
+o1-o1-o2-o3-o
 ```
 
-### 9) Global formatting: node-first vs edge-first, ascending vs descending
+Chirality is stored as `chirality=(ligands, '@'|'@@')` with ligands listed
+as node IDs (`None` for an implicit H or lone pair), and cis/trans as
+`cis_trans=((u, ref_u), (v, ref_v), 'c'|'t')`. Both are independent of the
+node order, so any `ordering` serializes correctly. `graph_to_mol()` raises
+`ValueError` for invalid valence or unsupported bond types.
 
-Encoding and decoding must use the same `node_first` setting; it is not stored
-in the string. The tokenizer captures the settings when it is constructed.
+### 5) Splitting SNACK strings
+
+```python
+import snack as snk
+
+sn = "C1-C(@)1-N(+)(H)2-C1=(t)C1-O(-)"
+print(snk.split(sn, pattern="token"))
+print(snk.split(sn, pattern="graph"))
+print(snk.split(sn, pattern="block"))
+print(snk.filter(sn, key="node_type"))
+print(snk.filter(sn, key="attribute"))
+print([snk.token_type(t) for t in snk.split(sn)][:8])
+```
+
+```text
+['C', '1', '-', 'C', '(@)', '1', '-', 'N', '(+)', '(H)', '2', '-', 'C', '1', '=', '(t)', 'C', '1', '-', 'O', '(-)']
+['C', '1-', 'C(@)', '1-', 'N(+)(H)', '2-', 'C', '1=(t)', 'C', '1-', 'O(-)']
+['C', '1-C(@)', '1-N(+)(H)', '2-C', '1=(t)C', '1-O(-)']
+['C', 'C', 'N', 'C', 'C', 'O']
+['(@)', '(+)', '(H)', '(t)', '(-)']
+['node_type', 'distance', 'edge_type', 'node_type', 'attribute', 'distance', 'edge_type', 'node_type']
+```
+
+### 6) Global formatting: node-first vs edge-first, ascending vs descending
+
+Encoding and decoding must use the same settings; they are not stored in the
+string. The tokenizer captures the settings when it is constructed.
 
 Supported orderings are `None` (input order), `"bfs"`, `"cm"` (Cuthill–McKee),
-`"uniform"`, and `"neighbor"`. All named orderings use Python's `random` module.
-Graph and RDKit-molecule conversion preserve input order by default.
+`"uniform"`, `"neighbor"`, or an explicit list of nodes. All named orderings
+use Python's `random` module.
 
 ```python
 import random
@@ -297,243 +237,249 @@ snk.config.set()  # Restore defaults for subsequent examples.
 ```
 
 ```text
-edge-first / descending: [C]1-[N]1-[C]1=[O]2-[N]1-[C]2-[C]1-[N]2=[C]1-[N]9-2-[C]1=[O]5=3-[C]4-[C]
-node-first / ascending : [C][N]1-[C]1-[O]1=[N]2-[C]1-[C]2-[N]1-[C]2=[N]1-[C]2-9-[O]1=[C]3-5=[C]4-
+edge-first / descending: C1-N1-C1=O2-N1-C2-C1-N2=C1-N9-2-C1=O5=3-C4-C
+node-first / ascending : CN1-C1-O1=N2-C1-C2-N1-C2=N1-C2-9-O1=C3-5=C4-
 ```
 
-### 10) Automorphism counting on a graph
+### 7) Decoding modes and canonical strings
 
-The result is an exact integer. Node types, edge types, and weights are treated
-as graph labels when determining symmetry.
+A stereo mark counts as a stereo element when RDKit's SMILES writer keeps
+it. By default decoding drops the other marks (`stereo="clean"`);
+`stereo="strict"` raises instead. `is_canonical_snack()` reports whether a
+string carries only necessary marks and hydrogen counts.
 
 ```python
-import networkx as nx
 import snack as snk
 
-# A 4-cycle has 8 automorphisms (dihedral group D4)
-G = nx.cycle_graph(4)
-aut = snk.count_automorphisms(G, node_key="node_type", edge_key="edge_type")
-print("automorphisms:", aut)
+text = "C1-C(@)1-C2-C"  # a center with two methyl groups is not stereogenic
+print(snk.snack_to_smiles(text), snk.is_canonical_snack(text))
+try:
+    snk.snack_to_smiles(text, stereo="strict")
+except ValueError as e:
+    print("strict:", e)
+print(snk.is_canonical_snack("C(H4)"), snk.is_canonical_snack("C(H2)1-C"))
 ```
 
 ```text
-automorphisms: 8
+CC(C)C False
+strict: Invalid molecular graph: Stereo annotations on non-stereogenic nodes [1] or bonds []
+False True
 ```
 
-### 11) Canonical and randomized SMILES
+### 8) The tokenizer
 
-Both helpers return `None` for invalid SMILES.
+`SnackTokenizer()` has one general vocabulary: `[pad]`, `[bos]`, `[eos]`,
+every element plus `*`, distances up to 1023, the three bonds and the
+attribute tokens (mass numbers 1 to 294, charges −8 to +8, hydrogen counts up
+to 8, chirality and cis/trans). `encode()` adds `[bos]` and `[eos]`. Pass
+`max_nodes` to change the number of distance tokens and `attributes` to keep
+only some attribute kinds. Isotope labels are rare, so dropping that kind
+removes 294 of the 1,471 tokens.
+
+```python
+import snack as snk
+
+tokenizer = snk.SnackTokenizer()
+print(len(tokenizer), tokenizer.max_nodes)
+print(tokenizer.tokens[:5], tokenizer.tokens[-6:])
+ids = tokenizer.encode("C1-O(-)")
+print(ids, tokenizer.decode(ids))
+```
+
+```text
+1471 1024
+('[pad]', '[bos]', '[eos]', 'H', 'He') ('(H7)', '(H8)', '(@)', '(@@)', '(c)', '(t)')
+[1, 8, 122, 1145, 10, 1449, 2] C1-O(-)
+```
+
+### 9) Generation masks
+
+Masks enforce the grammar, connectivity, the node limit and RDKit valence:
+bonds and hydrogens may not exceed what the element and charge allow, and
+`[eos]` is offered only when RDKit sanitizes the molecule.
+An atom written with too many bonds can only be continued by a charge that
+fixes it. A node whose hydrogen count is written gets RDKit's limit for atoms
+with a given H count, which is what makes noble-gas compounds reachable.
+
+```python
+import snack as snk
+
+tokenizer = snk.SnackTokenizer(max_nodes=6)
+
+def allowed(text):
+    return sorted(tokenizer.tokens[i] for i in tokenizer.allowed_next_ids(tokenizer.encode(text)[:-1]))
+
+print(allowed("O1"))
+print([t for t in allowed("C1-C1-C3-2-1=N") if snk.token_type(t) != "node_type"])
+print("[eos]" in allowed("C1-C1-C3-2-1=N(+)"))
+print("[eos]" in allowed("F1-Kr(H0)1-F"))
+```
+
+```text
+['-', '=']
+['(+)', '(+2)', '(+3)', '(+4)', '(+5)', '(+6)', '(+7)', '(+8)', '(1)', '(10)', '(100)', '(101)', '(102)', '(103)', '(104)', '(105)', '(106)', '(107)', '(108)', '(109)', '(11)', '(110)', '(111)', '(112)', '(113)', '(114)', '(115)', '(116)', '(117)', '(118)', '(119)', '(12)', '(120)', '(121)', '(122)', '(123)', '(124)', '(125)', '(126)', '(127)', '(128)', '(129)', '(13)', '(130)', '(131)', '(132)', '(133)', '(134)', '(135)', '(136)', '(137)', '(138)', '(139)', '(14)', '(140)', '(141)', '(142)', '(143)', '(144)', '(145)', '(146)', '(147)', '(148)', '(149)', '(15)', '(150)', '(151)', '(152)', '(153)', '(154)', '(155)', '(156)', '(157)', '(158)', '(159)', '(16)', '(160)', '(161)', '(162)', '(163)', '(164)', '(165)', '(166)', '(167)', '(168)', '(169)', '(17)', '(170)', '(171)', '(172)', '(173)', '(174)', '(175)', '(176)', '(177)', '(178)', '(179)', '(18)', '(180)', '(181)', '(182)', '(183)', '(184)', '(185)', '(186)', '(187)', '(188)', '(189)', '(19)', '(190)', '(191)', '(192)', '(193)', '(194)', '(195)', '(196)', '(197)', '(198)', '(199)', '(2)', '(20)', '(200)', '(201)', '(202)', '(203)', '(204)', '(205)', '(206)', '(207)', '(208)', '(209)', '(21)', '(210)', '(211)', '(212)', '(213)', '(214)', '(215)', '(216)', '(217)', '(218)', '(219)', '(22)', '(220)', '(221)', '(222)', '(223)', '(224)', '(225)', '(226)', '(227)', '(228)', '(229)', '(23)', '(230)', '(231)', '(232)', '(233)', '(234)', '(235)', '(236)', '(237)', '(238)', '(239)', '(24)', '(240)', '(241)', '(242)', '(243)', '(244)', '(245)', '(246)', '(247)', '(248)', '(249)', '(25)', '(250)', '(251)', '(252)', '(253)', '(254)', '(255)', '(256)', '(257)', '(258)', '(259)', '(26)', '(260)', '(261)', '(262)', '(263)', '(264)', '(265)', '(266)', '(267)', '(268)', '(269)', '(27)', '(270)', '(271)', '(272)', '(273)', '(274)', '(275)', '(276)', '(277)', '(278)', '(279)', '(28)', '(280)', '(281)', '(282)', '(283)', '(284)', '(285)', '(286)', '(287)', '(288)', '(289)', '(29)', '(290)', '(291)', '(292)', '(293)', '(294)', '(3)', '(30)', '(31)', '(32)', '(33)', '(34)', '(35)', '(36)', '(37)', '(38)', '(39)', '(4)', '(40)', '(41)', '(42)', '(43)', '(44)', '(45)', '(46)', '(47)', '(48)', '(49)', '(5)', '(50)', '(51)', '(52)', '(53)', '(54)', '(55)', '(56)', '(57)', '(58)', '(59)', '(6)', '(60)', '(61)', '(62)', '(63)', '(64)', '(65)', '(66)', '(67)', '(68)', '(69)', '(7)', '(70)', '(71)', '(72)', '(73)', '(74)', '(75)', '(76)', '(77)', '(78)', '(79)', '(8)', '(80)', '(81)', '(82)', '(83)', '(84)', '(85)', '(86)', '(87)', '(88)', '(89)', '(9)', '(90)', '(91)', '(92)', '(93)', '(94)', '(95)', '(96)', '(97)', '(98)', '(99)']
+True
+True
+```
+
+Use `allowed_node_types` / `allowed_edge_types` to restrict generation to a
+subset (for example organic elements) without changing token IDs,
+`allow_disconnected=True` for salts and mixtures, `ordering="bfs"` to
+restrict generation to BFS order, and `valence=False` to keep only the
+grammar checks. `encode(text, validate=True)` checks a string against the
+same masks.
+
+### 10) Masks for a whole sequence
+
+`get_logit_mask()` returns one row per position describing what may come
+next. Columns follow `tokenizer.tokens`. For training, row `i` predicts
+`ids[i + 1]`; before sampling, set logits to `-inf` where the mask is `False`.
+
+```python
+import snack as snk
+
+tokenizer = snk.SnackTokenizer("graph", ordering="bfs", max_nodes=2)
+ids = tokenizer.encode("o1-o")
+masks = tokenizer.get_logit_mask(ids[:-1])
+
+print("vocabulary:", tokenizer.tokens)
+for position, prefix in enumerate(["BOS", "o", "o1", "o1-"]):
+    print(f"after {prefix}:", masks[position])
+```
+
+```text
+vocabulary: ('[pad]', '[bos]', '[eos]', 'o', '1', '-')
+after BOS: [False, False, False, True, False, False]
+after o: [False, False, True, False, True, False]
+after o1: [False, False, False, False, False, True]
+after o1-: [False, False, False, True, False, False]
+```
+
+### 11) Incremental generation
 
 ```python
 import random
 import snack as snk
 
-random.seed(0)
-smi1 = snk.randomize_smiles('c1ccccc1CCC')
-smi2 = snk.randomize_smiles(smi1)
-canon = snk.canonicalize_smiles(smi1)
-
-print(smi1)
-print(smi2)
-print(canon)
+tokenizer = snk.SnackTokenizer(max_nodes=12, ordering="bfs", allowed_node_types=["C", "N", "O"], attributes=())
+rng = random.Random(0)
+state, ids = tokenizer.new_state(), []
+while True:
+    allowed = tokenizer.allowed_token_ids(state)
+    if len(state.nodes) < 8 and len(allowed) > 1:  # prefer growing the molecule
+        allowed = [i for i in allowed if i != tokenizer.eos_id]
+    choice = rng.choice(allowed)
+    tokenizer.step(state, choice)
+    ids.append(choice)
+    if choice == tokenizer.eos_id:
+        break
+text = tokenizer.decode(ids)
+print(text)
+print(snk.snack_to_smiles(text))
 ```
 
 ```text
-C(C)Cc1ccccc1
-C(CC)c1ccccc1
-CCCc1ccccc1
+N1=O2-N1=O
+O=NN=O
 ```
 
-### 12) SNACK → token IDs → SNACK
+Every sequence produced this way decodes to a sanitized RDKit molecule.
+Generated stereo marks may be unnecessary; filter with `is_canonical_snack()`.
+
+### 12) Automorphisms and generic graphs
+
+`count_automorphisms()` treats node types, attributes and bond types as
+colors; `stereo=True` additionally respects chirality and cis/trans (meso
+2,3-butanediol has 1 instead of 2).
 
 ```python
 import snack as snk
 
-tokenizer = snk.SnackTokenizer("graph", max_nodes=2)
-ids = tokenizer.encode("v1_v")
-
-print(ids)
-print(tokenizer.decode(ids))
+G = snk.smiles_to_graph("O[C@@H](C)[C@@H](C)O")
+print(snk.count_automorphisms(G), snk.count_automorphisms(G, stereo=True))
 ```
 
 ```text
-[1, 3, 4, 3, 2]
-v1_v
+2 1
 ```
 
-`encode()` adds `[bos]` (beginning) and `[eos]` (end). Presets provide different
-vocabularies:
+Generic graphs work the same way: `o` is a node with no type and `-` a plain
+edge, so `o1-o1-o` is a three-node path, and `SnackTokenizer("graph")` masks
+them. `load_dataset()` returns the bundled `community_small`, `ego`,
+`ego_small`, `enzymes`, `grid`, `grid_small`, `lobster`, `planar` and `sbm`
+splits (see [dataset details](snack/data/README.md)).
 
-| Preset | Vocabulary | Default `max_nodes` |
+Any other node or edge data is written as one `(key=value)` token per entry,
+sorted by name, after the compact attributes. Values may be integers, real
+numbers or strings; a node or edge type with no bare token, such as a label,
+uses the same form.
+
+```python
+import networkx as nx
+import snack as snk
+
+G = nx.Graph()
+G.add_node(0, node_type="hub", size=2)
+G.add_node(1)
+G.add_edge(0, 1, edge_type="knows", weight=3.5)
+
+text = snk.graph_to_snack(G)
+print(text)
+print(snk.graph_to_snack(nx.path_graph(3)))
+back = snk.snack_to_graph(text)
+print(back.nodes(data=True))
+print(back.edges(data=True))
+```
+
+```text
+o(node_type=hub)(size=2)1-(edge_type=knows)(weight=3.5)o
+o1-o1-o
+[(0, {'node_type': 'hub', 'size': 2}), (1, {})]
+[(0, 1, {'edge_type': 'knows', 'weight': 3.5})]
+```
+
+Because a plain edge and a single bond are both written `-`, decoding leaves
+`edge_type` unset for `-`, and the molecular layer reads a missing type as a
+single bond, the way an omitted SMILES bond does.
+
+## Coverage
+
+The notation and the default vocabulary were checked against the MoLFormer
+copies of PubChem and ZINC15: every molecule RDKit can parse is encoded,
+decoded and compared with RDKit's canonical SMILES. The report with element,
+charge, hydrogen-count and size statistics is generated into
+[docs/dataset_scan.md](docs/dataset_scan.md) by `scripts/aggregate_scan.py`.
+The table is from a stratified subset scanned with the final notation (every
+10th PubChem file chunk, every 50th ZINC15 chunk); the vocabulary ranges come
+from earlier full scans of both datasets.
+
+| | PubChem subset | ZINC15 subset |
 | --- | --- | --- |
-| `"graph"` | Non-attributed graphs | 128 |
-| `"zinc250k"` | ZINC250k atom types | 38 |
-| `"moses"` | MOSES atom types | 27 |
-| `"guacamol"` | GuacaMol atom types | 88 |
+| molecules checked | 11,440,000 | 20,519,928 |
+| molecules RDKit cannot parse | 33 | 0 |
+| isotopes (then unsupported, now encoded) | 0 | 4 |
+| encode or decode failure | 0 | 0 |
+| round trip differs from RDKit's canonical SMILES | 8 | 0 |
+| atoms per molecule | max 660, 99.9% ≤ 139 | max 38, 99.9% ≤ 36 |
+| tokens per molecule | max 2,082, mean 85 | max 135, mean 81 |
 
-### 13) Can a node or EOS come next?
+All 8 PubChem differences are RDKit artifacts: RDKit itself writes a different
+canonical SMILES for these molecules after its own parse/write cycle (the
+report classifies every recorded case and lists its SNACK string). Across the
+full datasets, the only other mismatch classes found were aromaticity
+perception that depends on atom order in a few fused ring systems and one
+conjugated hydrazone scaffold, both again RDKit's own behavior.
 
-`v1_` starts an edge but still needs its next node. A mask entry is `True` when
-that token is allowed. `[:-1]` removes EOS so we can continue the sequence.
-
-```python
-import snack as snk
-
-tokenizer = snk.SnackTokenizer("graph", ordering="bfs", max_nodes=2)
-ids = tokenizer.encode("v1_")[:-1]
-mask = tokenizer.next_token_mask(ids)
-
-print("node allowed:", mask[tokenizer.token_to_id["v"]])
-print("EOS allowed:", mask[tokenizer.eos_id])
-```
-
-```text
-node allowed: True
-EOS allowed: False
-```
-
-### 14) Masks for a whole sequence
-
-`get_logit_mask()` returns the same check at every position. Columns follow
-`tokenizer.tokens`; each row describes what can come next after its prefix.
-
-```python
-import snack as snk
-
-tokenizer = snk.SnackTokenizer("graph", ordering="bfs", max_nodes=2)
-ids = tokenizer.encode("v1_v")
-masks = tokenizer.get_logit_mask(ids[:-1])
-
-print("vocabulary:", tokenizer.tokens)
-print("after BOS:", masks[0])
-print("after v:", masks[1])
-print("after v1_:", masks[2])
-print("after v1_v:", masks[3])
-```
-
-```text
-vocabulary: ('[pad]', '[bos]', '[eos]', 'v', '1_')
-after BOS: [False, False, False, True, False]
-after v: [False, False, True, False, True]
-after v1_: [False, False, False, True, False]
-after v1_v: [False, False, True, False, False]
-```
-
-For training, row `i` predicts `ids[i + 1]`. Before sampling, set model scores
-(logits) to `-inf` where the mask is `False`.
-
-### 15) Stop at the node limit
-
-With `max_nodes=2`, completing `v1_v` leaves only EOS allowed.
-
-```python
-import snack as snk
-
-tokenizer = snk.SnackTokenizer("graph", ordering="bfs", max_nodes=2)
-ids = tokenizer.encode("v1_v")[:-1]
-mask = tokenizer.next_token_mask(ids)
-
-print("EOS allowed:", mask[tokenizer.eos_id])
-print("another edge allowed:", mask[tokenizer.token_to_id["1_"]])
-```
-
-```text
-EOS allowed: True
-another edge allowed: False
-```
-
-Use `allow_disconnected=True` for multiple components. `ordering="bfs"`
-restricts generation to BFS order; `ordering=None` disables that constraint.
-
-### 16) Molecular valence masks
-
-An oxygen with no existing bonds can accept a single or double bond, but the
-preset blocks a triple bond:
-
-```python
-import snack as snk
-
-tokenizer = snk.SnackTokenizer("moses", ordering="bfs")
-ids = tokenizer.encode("[O]1")[:-1]
-mask = tokenizer.next_token_mask(ids)
-
-print("single bond:", mask[tokenizer.token_to_id["-"]])
-print("double bond:", mask[tokenizer.token_to_id["="]])
-print("triple bond:", mask[tokenizer.token_to_id["#"]])
-```
-
-```text
-single bond: True
-double bond: True
-triple bond: False
-```
-
-Molecular presets use `-`, `=`, and `#` bonds and check RDKit validity before EOS.
-`valence=False` disables chemical checks. If every mask entry is `False`,
-backtrack or restart generation.
-
-### 17) Loading bundled datasets
-
-```python
-import snack as snk
-
-data = snk.load_dataset("planar")
-train, val, test = data["train"], data["val"], data["test"]
-print("split sizes:", len(train), len(val), len(test))
-```
-
-```text
-split sizes: 128 32 40
-```
-
-Each split is a list of SNACK strings. Supported names are `community_small`,
-`ego`, `ego_small`, `enzymes`, `grid`, `grid_small`, `lobster`, `planar`, and `sbm`. 
-See [dataset details](snack/data/README.md) for details. 
+The default vocabulary covers everything observed in the full datasets:
+charges from −4 to +8, written hydrogen counts up to 7 (`Re(H7)`, `P(H5)`,
+`I(H5)`), 891 atoms and a largest distance of 593. Any `max_nodes` between
+the molecule size you train on and 1024 works; the masks cost time
+proportional to the molecule, not to the vocabulary.
 
 ## Not supported
 
-- **Atom chirality:** `@`/`@@` and R/S configurations are not encoded or restored.
-- **Bond stereochemistry:** Cis/trans and E/Z information is omitted. Stereo
-  double bonds become ordinary `=` bonds, so stereoisomers can share the same
-  SNACK representation.
-- **Explicit radical states:** Radical-electron counts are not serialized.
-  With `use_hydrogens=True`, RDKit can infer radical states from hydrogen counts,
-  charges, and bonds. Without these counts, radical information may be lost;
-  for example, `[CH3]` becomes `[C]` and decodes as methane.
-
-### Radical example
-
-Hydrogen counts preserve the radical in this example; the default conversion
-loses it.
-
-```python
-import snack as snk
-
-smiles = "[CH2]c1c[nH]c2ccccc12"
-sn = snk.smiles_to_snack(smiles, ordering=None)
-sn_h = snk.smiles_to_snack(smiles, ordering=None, use_hydrogens=True)
-
-print("default:", snk.snack_to_smiles(sn))
-print("with H counts:", snk.snack_to_smiles(sn_h))
-```
-
-```text
-default: Cc1c[nH]c2ccccc12
-with H counts: [CH2]c1c[nH]c2ccccc12
-```
-
-### Chirality example
-
-Atom chirality is lost even when hydrogen counts are preserved.
-
-```python
-import snack as snk
-
-smiles = "N[C@@H](C)C(=O)O"
-sn = snk.smiles_to_snack(smiles, ordering=None, use_hydrogens=True)
-print("decoded:", snk.snack_to_smiles(sn))
-```
-
-```text
-decoded: CC(N)C(=O)O
-```
+- Atom map numbers and bond types other than single, double and triple
+  (dative, aromatic input is kekulized).
+- Axial chirality (allenes, atropisomers), square-planar/octahedral metal
+  centers, enhanced stereo groups (and/or), and unknown ("wavy") stereo.
+- 3D coordinates, conformers, and tautomers.

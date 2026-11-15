@@ -1,4 +1,4 @@
-# Sequential Notation of Adjacent Connectivity FrameworK (SNACK)
+# Sequential Notation of Adjacent Connectivity FrameworK (SNACK) for molecules
 __version__ = "0.1.0"
 
 from snack.dataset import load_dataset
@@ -15,6 +15,7 @@ from snack.mol import (
     mol_to_snack,
     canonicalize_smiles,
     randomize_smiles,
+    is_canonical_snack,
 )
 from snack.graph import (
     graph_to_tokens,
@@ -26,9 +27,12 @@ from snack.graph import (
     token_type,
     count_automorphisms,
     relabel_nodes,
+    attribute_token,
+    parse_attribute,
+    ATTRIBUTES,
 )
 from snack import graph as _graph
-from snack.tokenizer import SnackTokenizer, basic_vocabulary
+from snack.tokenizer import SnackTokenizer, basic_vocabulary, attribute_tokens, elements
 
 
 class config:
