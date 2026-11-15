@@ -13,9 +13,18 @@ from numbers import Integral
 
 from snack import graph as _graph
 
-PRESETS = ('graph', 'mol')
-# Defaults derived from the PubChem/ZINC15 scan; every observed value is covered.
-MAX_NODES = {'graph': 128, 'mol': 1024}
+PRESETS = ('graph', 'mol', 'qm9', 'moses')
+MAX_NODES = {'graph': 128, 'mol': 128, 'qm9': 9, 'moses': 26}
+# Dataset presets, measured over the whole dataset with
+# scripts/fit_tokenizer.py: QM9 is 133,885 molecules of at most 9 heavy atoms
+# over C, F, N, O, net neutral but with charged atoms in 1,847 of them; MOSES
+# is 1,936,962 molecules of at most 26 atoms over Br, C, Cl, F, N, O, S with
+# no charges and no stereochemistry. Everything else follows 'mol'.
+DATASETS = {
+    'qm9': {'node_types': ('C', 'F', 'N', 'O'), 'attributes': ('charge',),
+            'charges': (-1, 1)},
+    'moses': {'node_types': ('Br', 'C', 'Cl', 'F', 'N', 'O', 'S'), 'attributes': ()},
+}
 CHARGES = tuple(range(-8, 0)) + tuple(range(1, 9))
 MAX_HYDROGENS = 8
 # One token per mass number, up to the heaviest known nuclide, so every isotope
@@ -24,7 +33,18 @@ MAX_HYDROGENS = 8
 # corpus should narrow this or drop the kind entirely.
 MAX_ISOTOPE = 294
 UNLIMITED = 1 << 16
-_BOND_ORDERS = {'-': 1, '=': 2, '#': 3}
+# Bond orders for the valence mask. An aromatic bond is 1.5 in truth, and
+# counting it as 1 keeps the arithmetic integral and the mask permissive
+# rather than wrongly restrictive; the sanitization check at EOS is what
+# rejects an aromatic ring that no kekule structure supports.
+_BOND_ORDERS = {'-': 1, '=': 2, '#': 3, 'a': 1}
+# Molecular vocabularies list the kekule bonds. Aromaticity is a property of
+# a whole ring system, so a mask that looks at one node at a time cannot
+# promise a kekulizable ring: an aromatic bond that no kekule structure
+# supports never sanitizes, EOS stays blocked and generation dead-ends. Pass
+# edge_types=('-', '=', '#', 'a') to model the aromatic form anyway, and
+# handle an empty allowed set as a dead end.
+DEFAULT_EDGE_TYPES = ('-', '=', '#')
 
 
 def elements():
@@ -56,13 +76,21 @@ def attribute_tokens(attributes=None, *, charges=CHARGES, max_hydrogens=MAX_HYDR
 def basic_vocabulary(preset='mol', max_nodes=None, max_distance=None, *, attributes=None):
     """Return stable tokens, including [pad], [bos], [eos], for a preset.
 
-    'mol' lists every element, distances, the bonds -, = and # and the
+    'mol' lists every element, distances, the bonds -, =, # and a and the
     attribute tokens; 'graph' lists o, the distances and the plain edge -.
+    'qm9' and 'moses' are 'mol' narrowed to what those datasets contain.
     """
     if preset not in PRESETS:
         raise ValueError(f'preset must be one of {PRESETS}')
     if attributes is not None and preset == 'graph':
         raise ValueError('Attributes require the mol preset')
+    dataset = DATASETS.get(preset)
+    ranges = {}
+    if dataset is not None:
+        if attributes is None:
+            attributes = dataset['attributes']
+        ranges = {key: dataset[key] for key in ('charges', 'max_hydrogens', 'max_isotope')
+                  if key in dataset}
     maximum = MAX_NODES[preset] if max_nodes is None else max_nodes
     if not isinstance(maximum, Integral) or isinstance(maximum, bool) or maximum < 1:
         raise ValueError('max_nodes must be a positive integer')
@@ -72,8 +100,9 @@ def basic_vocabulary(preset='mol', max_nodes=None, max_distance=None, *, attribu
     if preset == 'graph':
         return (['[pad]', '[bos]', '[eos]', _graph.DEFAULT_NODE_TOKEN]
                 + [str(i) for i in range(1, distance + 1)] + [_graph.PLAIN_EDGE])
-    return (['[pad]', '[bos]', '[eos]'] + list(elements()) + [str(i) for i in range(1, distance + 1)]
-            + list(_BOND_ORDERS) + attribute_tokens(attributes))
+    node_types = list(elements()) if dataset is None else list(dataset['node_types'])
+    return (['[pad]', '[bos]', '[eos]'] + node_types + [str(i) for i in range(1, distance + 1)]
+            + list(DEFAULT_EDGE_TYPES) + attribute_tokens(attributes, **ranges))
 
 
 @lru_cache(maxsize=None)
@@ -180,9 +209,9 @@ class SnackTokenizer:
         if not self.node_types or any(_graph.token_type(token) != 'node_type' for token in self.node_types):
             raise ValueError('node_types must contain valid SNACK node tokens')
         if any(_graph.token_type(token) != 'edge_type' for token in self.edge_types):
-            raise ValueError('edge_types must contain -, = or #')
+            raise ValueError('edge_types must contain -, =, # or a')
         if not self.edge_types:
-            raise ValueError('Every edge needs a type token: - = or #')
+            raise ValueError('Every edge needs a type token: -, =, # or a')
         if not self.molecular and self.edge_types != (_graph.PLAIN_EDGE,):
             raise ValueError(f'Graph mode uses the plain edge {_graph.PLAIN_EDGE} alone')
         distances = [token for token in base if _graph.token_type(token) == 'distance']

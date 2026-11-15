@@ -11,6 +11,7 @@ BONDTYPE_TO_SYMBOL = {
     Chem.BondType.SINGLE: '-',
     Chem.BondType.DOUBLE: '=',
     Chem.BondType.TRIPLE: '#',
+    Chem.BondType.AROMATIC: 'a',
 }
 SYMBOL_TO_BONDTYPE = {symbol: bond for bond, symbol in BONDTYPE_TO_SYMBOL.items()}
 assert tuple(SYMBOL_TO_BONDTYPE) == EDGE_TYPES
@@ -54,13 +55,20 @@ def string_to_atom(atom_type: str) -> Chem.Atom:
     return Chem.Atom(_element(atom_type))
 
 
-def smiles_to_mol(smiles):
-    """Parse SMILES into a kekulized molecule or raise ValueError."""
+def smiles_to_mol(smiles, *, kekulize=True):
+    """Parse SMILES into a molecule or raise ValueError.
+
+    Kekulized by default, so an aromatic ring is written with alternating -
+    and = bonds. ``kekulize=False`` keeps RDKit's aromatic bonds, which are
+    written as a: benzene is C1aC1aC1aC1aC5a1aC instead of C1=C1-C1=C1-C5-1=C.
+    """
     if not isinstance(smiles, str):
         raise ValueError('SMILES must be a string')
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         raise ValueError(f'Invalid SMILES: {smiles!r}')
+    if not kekulize:
+        return mol
     try:
         Chem.Kekulize(mol, clearAromaticFlags=True)
     except (RuntimeError, ValueError) as exc:
@@ -209,7 +217,8 @@ def mol_to_graph(mol, attributes=None):
     bonds = []
     for bond in mol.GetBonds():
         if bond.GetBondType() not in BONDTYPE_TO_SYMBOL:
-            raise ValueError(f'Unsupported bond type: {bond.GetBondType()}; kekulize the molecule')
+            raise ValueError(f'Unsupported bond type: {bond.GetBondType()}; kekulize the molecule '
+                             'or use single, double, triple or aromatic bonds')
         bonds.append((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), bond.GetBondType()))
     node_types, data = [], []
     for atom in mol.GetAtoms():
@@ -266,8 +275,8 @@ def graph_to_mol(graph, *, stereo='clean'):
         for u, v, data in graph.edges(data=True):
             edge_type = bond_symbol(data)
             if edge_type not in SYMBOL_TO_BONDTYPE:
-                raise ValueError(f'Molecular graphs require edge_type -, = or # on every edge, '
-                                 f'got {edge_type!r}')
+                raise ValueError(f'Molecular graphs require edge_type -, =, # or a on every '
+                                 f'edge, got {edge_type!r}')
             mol.AddBond(rank[u], rank[v], order=SYMBOL_TO_BONDTYPE[edge_type])
         Chem.SanitizeMol(mol)
         has_stereo = _apply_stereo(graph, mol, nodes, rank, stereo)
@@ -313,11 +322,11 @@ def _apply_stereo(graph, mol, nodes, rank, mode):
         atom.SetChiralTag(_CHIRAL_TAGS[sign if perm_parity(ligands, order) == 1 else _FLIP[sign]])
     requested_bonds = set()
     for (u, v), (refs, mark) in cis_trans.items():
-        # Only a double bond whose substituents hang off single bonds has
-        # cis/trans stereo; cumulated double bonds have axial stereo instead,
-        # which RDKit cannot write with / and \\.
+        # Only a double bond whose substituents hang off single or aromatic
+        # bonds has cis/trans stereo; cumulated double bonds have axial stereo
+        # instead, which RDKit cannot write with / and \\.
         if bond_symbol(graph.edges[u, v]) != '=' or any(
-                bond_symbol(graph.edges[end, other]) != '-'
+                bond_symbol(graph.edges[end, other]) not in ('-', 'a')
                 for end, mate in ((u, v), (v, u)) for other in graph[end] if other != mate):
             if mode == 'strict':
                 raise ValueError(f'Cis/trans annotation on edge {(u, v)!r} requires single bonds '
@@ -368,22 +377,23 @@ def is_canonical_snack(snack):
     return not _redundant_hydrogens(graph)
 
 
-def smiles_to_graph(smiles, attributes=None):
-    return mol_to_graph(smiles_to_mol(smiles), attributes)
+def smiles_to_graph(smiles, attributes=None, *, kekulize=True):
+    return mol_to_graph(smiles_to_mol(smiles, kekulize=kekulize), attributes)
 
 
 def graph_to_smiles(graph, canonical=True, *, stereo='clean'):
     return mol_to_smiles(graph_to_mol(graph, stereo=stereo), canonical)
 
 
-def smiles_to_snack(smiles, ordering='bfs', *, attributes=None, attributed=True):
+def smiles_to_snack(smiles, ordering='bfs', *, attributes=None, attributed=True, kekulize=True):
     """Encode SMILES with randomized BFS by default; None preserves input atom order.
 
-    ``attributes`` selects which of charge, hydrogens, chirality and cis_trans
-    to write (default: all). Omitting charge or hydrogens
-    can change the molecule's identity or prevent decoding.
+    ``attributes`` selects which of isotope, charge, hydrogens, chirality and
+    cis_trans to write (default: all). Omitting charge or hydrogens can change
+    the molecule's identity or prevent decoding. ``kekulize=False`` keeps
+    aromatic bonds and writes them as a.
     """
-    graph = smiles_to_graph(smiles, attributes)
+    graph = smiles_to_graph(smiles, attributes, kekulize=kekulize)
     return graph_to_snack(graph, ordering, attributed=attributed)
 
 

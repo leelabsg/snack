@@ -42,12 +42,14 @@ class TokenizerTests(unittest.TestCase):
         self.assertEqual(len(isotope_tokens), 294)
         tokenizer = SnackTokenizer()
         self.assertEqual(tuple(basic_vocabulary()), tokenizer.tokens)
-        self.assertEqual(len(tokenizer), 1471)
-        # Excluding the isotope kind reproduces the vocabulary that predates it.
-        without = SnackTokenizer(attributes=('charge', 'hydrogens', 'chirality', 'cis_trans'))
-        self.assertEqual(len(without), 1177)
-        self.assertEqual(without.tokens, tuple(t for t in tokenizer.tokens
-                                               if t not in isotope_tokens))
+        self.assertEqual(len(tokenizer), 575)
+        self.assertEqual((tokenizer.max_nodes, tokenizer.max_distance), (128, 127))
+        # The 1,177-token vocabulary of the MOSES runs, before the isotope kind
+        # and the smaller node limit, is still reachable.
+        before = SnackTokenizer(max_nodes=1024,
+                                attributes=('charge', 'hydrogens', 'chirality', 'cis_trans'))
+        self.assertEqual(len(before), 1177)
+        self.assertEqual(set(tokenizer.tokens) - set(before.tokens) - isotope_tokens, set())
         self.assertEqual(tokenizer.tokens[:3], ('[pad]', '[bos]', '[eos]'))
         self.assertEqual(len(elements()), 119)
         self.assertEqual(elements()[:3], ('H', 'He', 'Li'))
@@ -55,9 +57,9 @@ class TokenizerTests(unittest.TestCase):
         for token in ('H', 'C', 'Cl', 'Og', '*', '-', '=', '#', '(@)', '(@@)', '(H0)', '(H)', '(H8)', '(+)',
                       '(+2)', '(+8)', '(-)', '(-8)', '(c)', '(t)', '1', str(tokenizer.max_distance)):
             self.assertIn(token, tokenizer.token_to_id)
-        self.assertEqual(tokenizer.max_nodes, 1024)
-        for token in ('(+9)', '(-9)', '(H9)', '(.)', '(.2)', '0', '1024', 'o', '[C]', 'c',
-                      '(0)', '(295)', '(13C)'):
+        self.assertEqual(tokenizer.max_nodes, 128)
+        for token in ('(+9)', '(-9)', '(H9)', '(.)', '(.2)', '0', '128', '1024', 'o', '[C]', 'c',
+                      '(0)', '(295)', '(13C)', 'u'):
             self.assertNotIn(token, tokenizer.token_to_id)
         self.assertEqual(tokenizer.node_types, elements())
         self.assertEqual(tokenizer.edge_types, ('-', '=', '#'))
@@ -86,6 +88,59 @@ class TokenizerTests(unittest.TestCase):
                          {t for t in self.attributes_allowed(tokenizer, 'C') if t.startswith('(H')})
         self.assertEqual(snack.snack_to_smiles('C(13)(+)(H3)'), '[13CH3+]')
 
+    def test_dataset_presets(self):
+        from snack.tokenizer import DATASETS
+        sizes = {'qm9': 20, 'moses': 38}
+        for preset, size in sizes.items():
+            with self.subTest(preset=preset):
+                tokenizer = SnackTokenizer(preset)
+                self.assertEqual(len(tokenizer), size)
+                self.assertEqual(tokenizer.node_types, DATASETS[preset]['node_types'])
+                self.assertEqual(tokenizer.edge_types, ('-', '=', '#'))
+                self.assertTrue(tokenizer.molecular)
+                self.assertTrue(tokenizer.valence)
+                self.assertEqual(tokenizer.max_distance, tokenizer.max_nodes - 1)
+        self.assertEqual(SnackTokenizer('qm9').max_nodes, 9)
+        self.assertEqual(SnackTokenizer('moses').max_nodes, 26)
+        # MOSES needs no attributes; QM9 needs single charges and nothing else.
+        self.assertEqual(SnackTokenizer('moses').attribute_types, ())
+        self.assertEqual(SnackTokenizer('qm9').attribute_types, ('(-)', '(+)'))
+        # Overrides still win over the preset.
+        self.assertEqual(SnackTokenizer('qm9', max_nodes=12).max_nodes, 12)
+        self.assertEqual(SnackTokenizer('qm9', attributes=()).attribute_types, ())
+        with self.assertRaises(ValueError):
+            SnackTokenizer('zinc250k')
+
+    def test_presets_encode_their_datasets(self):
+        qm9 = SnackTokenizer('qm9', ordering='bfs')
+        moses = SnackTokenizer('moses', ordering='bfs')
+        for tokenizer, molecules in ((qm9, ['CC(=O)NC', 'O=[N+]([O-])C', 'FC1CC1O', 'CC#N']),
+                                     (moses, ['CC(=O)Oc1ccccc1C(=O)O', 'Brc1ccc(S(N)(=O)=O)cc1',
+                                              'CN1CCN(c2ccccc2)CC1'])):
+            for smiles in molecules:
+                with self.subTest(smiles=smiles):
+                    text = snack.smiles_to_snack(smiles, ordering='bfs')
+                    ids = tokenizer.encode(text, validate=True)
+                    self.assertEqual(tokenizer.decode(ids), text)
+                    self.assertEqual(snack.snack_to_smiles(tokenizer.decode(ids)),
+                                     Chem.MolToSmiles(Chem.MolFromSmiles(smiles)))
+
+    def test_aromatic_bonds_are_opt_in(self):
+        text = snack.smiles_to_snack('c1ccccc1', ordering=None, kekulize=False)
+        # The kekule bonds are the default, so an aromatic string is refused
+        # outright rather than encoded into a vocabulary whose mask forbids it.
+        default = SnackTokenizer(max_nodes=8)
+        self.assertNotIn('a', default.token_to_id)
+        with self.assertRaisesRegex(ValueError, 'outside this vocabulary'):
+            default.encode(text)
+        self.assertNotIn('a', self.allowed(default, 'C1'))
+        self.assertNotIn('a', self.allowed(SnackTokenizer('moses'), 'C1'))
+        # Asking for it puts it in the vocabulary and in generation together.
+        aromatic = SnackTokenizer(max_nodes=8, edge_types=('-', '=', '#', 'a'))
+        self.assertEqual(len(aromatic), len(default) + 1)
+        self.assertEqual(aromatic.decode(aromatic.encode(text)), text)
+        self.assertIn('a', self.allowed(aromatic, 'C1'))
+
     def test_attribute_selection_and_graph_preset(self):
         charged = SnackTokenizer(attributes=('charge',))
         self.assertTrue(all(snack.graph.parse_attribute(t)[0] == 'charge' for t in charged.attribute_types))
@@ -99,7 +154,7 @@ class TokenizerTests(unittest.TestCase):
             SnackTokenizer('graph', attributes=('charge',))
         for kwargs in ({'max_nodes': 0}, {'max_nodes': True}, {'max_nodes': 3, 'max_distance': 3},
                        {'ordering': 'cm'}, {'preset': 'zinc250k'}, {'preset': 'graph', 'valence': True},
-                       {'attributes': ('mass',)}, {'attributes': ('radical',)}, {'edge_types': ['a']},
+                       {'attributes': ('mass',)}, {'attributes': ('radical',)}, {'edge_types': ['u']}, {'edge_types': ['a', 'a']},
                        {'node_types': ['C+']}, {'node_types': ['[C]']}, {'node_types': ['Xx']},
                        {'allowed_node_types': ['Xx']}, {'allowed_node_types': ['[C]']}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):

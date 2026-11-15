@@ -15,39 +15,72 @@ Neural Information Processing Systems (NeurIPS), 2026
    <img src="image/snack_fig.png" alt="SNACK encoding process" width="650px">
 </p>
 
-`snack-mol` is a fork of [`snack-graph`](https://github.com/leelabsg/snack) that
-extends the SNACK string notation to the full range of molecules found in
-PubChem and ZINC: charges, hydrogen counts, chirality and cis/trans double
-bonds, with a single general vocabulary. It converts between
+
+🍿 **SNACK** represents discrete graphs as compact strings using four basic elements. For example, in molecular graphs:
+- Node type: Atom type (C, N, O, ...)
+- Edge type: Bond type (-, =, #, ...)
+- Attributes: Formal charge, hydrogen count, chirality, isotope, ...
+- Distance: Graph distance between connected atoms (1, 2, 3, ...)
+
+🍿 **SNACK** encodes graphs as sequences of tokens in the following order:
+
+`Node type → (Node attributes) → Distance → Edge type → (Edge attributes) → Node type`
+
+For example, **CH₂=NH₂⁺** is encoded as:
+
+```python
+import snack as snk
+
+snk.smiles_to_snack('C=[NH2+]')
+```
+```text
+C1=N(+)
+```
+
+where:
+- **`C`** and **`N`**: Node types.
+- **`1`**: Distance between two nodes, calculated as the difference between their node indices.
+- **`=`**: Edge type (double bond).
+- **`(+)`**: Node attribute (positive formal charge).
+- **Implicit hydrogens**: Hydrogen atoms are omitted and inferred from the molecular structure.
+
+Node and edge attributes are optional and included only when needed.
+
+
+> Note: N(+) can be split into separate tokens (N and (+)) or treated as a single token (N(+)). In the paper, we adopt the latter approach.
+
+General graphs are also supported by setting default node and edge types:
+```python
+import snack as snk
+
+G = snk.snack_to_graph('o(color=blue)1-o(color=red)2-o')
+G.nodes.data(True)
+```
+```text
+NodeDataView({0: {'color': 'blue'}, 1: {'color': 'red'}, 2: {}})
+```
+
+
+## Installation
+
+`snack-graph` offers helper utilities to convert between:
 
 - **SMILES / RDKit molecules** ↔ **SNACK strings**
 - **NetworkX graphs** ↔ **SNACK strings**
 
-Dependencies: `networkx`, `pynauty`, and `rdkit`. The tokenizer does not
-require PyTorch, NumPy or pandas.
-
-## Installation
-
 ```bash
-pip install snack-mol
+pip install snack-graph
 ```
 
 ## Notation
 
-A SNACK string lists nodes in a chosen order. Each node is preceded (edge-first,
-the default) or followed (node-first) by its edges to earlier nodes, written as
-the *distance* back to the neighbor followed by the bond type:
-
-```text
-C1-C1-O        CCO        C1=C1-C1=C1-C5-1=C   benzene
-```
 
 | Element | Spelling | Notes |
 | --- | --- | --- |
 | Atom | `C`, `Cl`, `Fe`, `*` | Element symbol, no brackets; every element is supported. |
 | Node | `o` | A node with no type, for generic graphs. |
 | Distance | `1`, `2`, ... | Number of nodes back to the neighbor. |
-| Bond | `-`, `=`, `#` | Molecules are always kekulized; there is no aromatic bond token. `-` is also the plain edge of a generic graph. |
+| Bond | `-`, `=`, `#`, `a` | Single, double, triple, aromatic. `-` is the plain edge of a generic graph. |
 | Isotope | `(2)`, `(13)`, `(235)`, ... | After the atom, before the others. The bare mass number: `C(13)` is carbon-13. |
 | Charge | `(+)`, `(-)`, `(+2)`, `(-3)`, ... | After the atom. `+2` rather than `++`. |
 | Hydrogens | `(H0)`, `(H)`, `(H2)`, ... | After the atom. Written only when the count cannot be inferred: `C` is `C(H4)`. |
@@ -75,7 +108,7 @@ the unpaired electrons on decoding. Atom map numbers are not supported.
 | `split()` | Split a SNACK string into tokens, distance–bond pairs, or node blocks. |
 | `filter()` | Extract node, distance, bond or attribute tokens from a SNACK string. |
 | `is_canonical_snack()` | Check that every stereo mark and hydrogen count in a string is necessary. |
-| `SnackTokenizer()` | Create the general molecular tokenizer (or the `graph` preset). |
+| `SnackTokenizer()` | Create the general molecular tokenizer, or the `graph`, `qm9` or `moses` preset. |
 | `tokenizer.encode()` / `tokenizer.decode()` | Convert between SNACK strings and integer token IDs. |
 | `tokenizer.get_logit_mask()` | Return an allowed-next-token mask after each token in a sequence. |
 | `count_automorphisms()` | Count graph symmetries while respecting atom attributes and stereo. |
@@ -138,8 +171,8 @@ atom unless its H count is given, as in `Kr(H0)`.
 ### 3) Choosing which attributes to keep
 
 `attributes` selects any subset of `isotope`, `charge`, `hydrogens`,
-`chirality` and `cis_trans`. Dropping any of them changes the molecule that is
-decoded.
+`chirality` and `cis_trans`. Dropping a kind the molecule carries changes the
+molecule that is decoded.
 
 ```python
 import snack as snk
@@ -157,7 +190,28 @@ None                       C1-C(13)(@)1-N(+)2-C1=O2-O(-)                C[13C@H]
 ()                         C1-C1-N2-C1=O2-O                             CC(N)C(=O)O
 ```
 
-### 4) Molecules as NetworkX graphs
+### 4) Aromatic or kekule form
+
+Molecules are kekulized by default, so an aromatic ring alternates `-` and
+`=`. Pass `kekulize=False` to keep RDKit's aromatic bonds and write them as
+`a`. Both forms decode to the same molecule.
+
+```python
+import snack as snk
+
+for smiles in ["c1ccccc1", "Cc1ccc(O)cc1", "c1cc[nH]c1"]:
+    kekule = snk.smiles_to_snack(smiles, ordering=None)
+    aromatic = snk.smiles_to_snack(smiles, ordering=None, kekulize=False)
+    print(f"{aromatic:28} {kekule:28} {snk.snack_to_smiles(aromatic)}")
+```
+
+```text
+C1aC1aC1aC1aC5a1aC           C1=C1-C1=C1-C5-1=C           c1ccccc1
+C1-C1aC1aC1aC1-O2aC6a1aC     C1-C1=C1-C1=C1-O2-C6-1=C     Cc1ccc(O)cc1
+C1aC1aC1aN(H)4a1aC           C1-C1=C1-N4=1-C              c1cc[nH]c1
+```
+
+### 5) Molecules as NetworkX graphs
 
 Graphs store the attributes under the same names. `attributed=False`
 keeps only connectivity.
@@ -185,7 +239,7 @@ as node IDs (`None` for an implicit H or lone pair), and cis/trans as
 node order, so any `ordering` serializes correctly. `graph_to_mol()` raises
 `ValueError` for invalid valence or unsupported bond types.
 
-### 5) Splitting SNACK strings
+### 6) Splitting SNACK strings
 
 ```python
 import snack as snk
@@ -206,39 +260,6 @@ print([snk.token_type(t) for t in snk.split(sn)][:8])
 ['C', 'C', 'N', 'C', 'C', 'O']
 ['(@)', '(+)', '(H)', '(t)', '(-)']
 ['node_type', 'distance', 'edge_type', 'node_type', 'attribute', 'distance', 'edge_type', 'node_type']
-```
-
-### 6) Global formatting: node-first vs edge-first, ascending vs descending
-
-Encoding and decoding must use the same settings; they are not stored in the
-string. The tokenizer captures the settings when it is constructed.
-
-Supported orderings are `None` (input order), `"bfs"`, `"cm"` (Cuthill–McKee),
-`"uniform"`, `"neighbor"`, or an explicit list of nodes. All named orderings
-use Python's `random` module.
-
-```python
-import random
-import snack as snk
-
-random.seed(0)
-smiles = "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"  # caffeine
-
-snk.config.set(node_first=False, ascending=False)
-s1 = snk.smiles_to_snack(smiles, ordering="neighbor")
-
-random.seed(0)
-snk.config.set(node_first=True, ascending=True)
-s2 = snk.smiles_to_snack(smiles, ordering="neighbor")
-
-print("edge-first / descending:", s1)
-print("node-first / ascending :", s2)
-snk.config.set()  # Restore defaults for subsequent examples.
-```
-
-```text
-edge-first / descending: C1-N1-C1=O2-N1-C2-C1-N2=C1-N9-2-C1=O5=3-C4-C
-node-first / ascending : CN1-C1-O1=N2-C1-C2-N1-C2=N1-C2-9-O1=C3-5=C4-
 ```
 
 ### 7) Decoding modes and canonical strings
@@ -269,12 +290,27 @@ False True
 ### 8) The tokenizer
 
 `SnackTokenizer()` has one general vocabulary: `[pad]`, `[bos]`, `[eos]`,
-every element plus `*`, distances up to 1023, the three bonds and the
-attribute tokens (mass numbers 1 to 294, charges −8 to +8, hydrogen counts up
-to 8, chirality and cis/trans). `encode()` adds `[bos]` and `[eos]`. Pass
-`max_nodes` to change the number of distance tokens and `attributes` to keep
-only some attribute kinds. Isotope labels are rare, so dropping that kind
-removes 294 of the 1,471 tokens.
+every element plus `*`, distances up to 127, the kekule bonds `-`, `=`, `#`
+and the attribute tokens (mass numbers 1 to 294, charges −8 to +8, hydrogen
+counts up to 8, chirality and cis/trans). `encode()` adds `[bos]` and
+`[eos]`. Pass `max_nodes` to change the number of distance tokens and
+`attributes` to keep only some attribute kinds. Isotope labels are rare, so
+dropping that kind removes 294 of the 575 tokens.
+
+Besides `"mol"` and `"graph"` there are presets fitted to a dataset, each
+measured over the whole of it with `scripts/fit_tokenizer.py`:
+
+| Preset | Tokens | Node types | Node limit | Attributes |
+| --- | ---: | --- | ---: | --- |
+| `"qm9"` | 20 | C, F, N, O | 9 | charge ±1 |
+| `"moses"` | 38 | Br, C, Cl, F, N, O, S | 26 | none |
+
+The aromatic bond is not in these vocabularies. Aromaticity is a property of
+a whole ring system, so a mask that looks at one node at a time cannot
+promise that a ring has a kekule structure: an aromatic bond that no kekule
+structure supports never sanitizes, `[eos]` stays blocked and generation
+dead-ends. Pass `edge_types=("-", "=", "#", "a")` to model the aromatic form
+anyway, and treat an empty allowed set as a dead end.
 
 ```python
 import snack as snk
@@ -287,9 +323,9 @@ print(ids, tokenizer.decode(ids))
 ```
 
 ```text
-1471 1024
+575 128
 ('[pad]', '[bos]', '[eos]', 'H', 'He') ('(H7)', '(H8)', '(@)', '(@@)', '(c)', '(t)')
-[1, 8, 122, 1145, 10, 1449, 2] C1-O(-)
+[1, 8, 122, 249, 10, 553, 2] C1-O(-)
 ```
 
 ### 9) Generation masks
@@ -310,14 +346,12 @@ def allowed(text):
     return sorted(tokenizer.tokens[i] for i in tokenizer.allowed_next_ids(tokenizer.encode(text)[:-1]))
 
 print(allowed("O1"))
-print([t for t in allowed("C1-C1-C3-2-1=N") if snk.token_type(t) != "node_type"])
 print("[eos]" in allowed("C1-C1-C3-2-1=N(+)"))
 print("[eos]" in allowed("F1-Kr(H0)1-F"))
 ```
 
 ```text
 ['-', '=']
-['(+)', '(+2)', '(+3)', '(+4)', '(+5)', '(+6)', '(+7)', '(+8)', '(1)', '(10)', '(100)', '(101)', '(102)', '(103)', '(104)', '(105)', '(106)', '(107)', '(108)', '(109)', '(11)', '(110)', '(111)', '(112)', '(113)', '(114)', '(115)', '(116)', '(117)', '(118)', '(119)', '(12)', '(120)', '(121)', '(122)', '(123)', '(124)', '(125)', '(126)', '(127)', '(128)', '(129)', '(13)', '(130)', '(131)', '(132)', '(133)', '(134)', '(135)', '(136)', '(137)', '(138)', '(139)', '(14)', '(140)', '(141)', '(142)', '(143)', '(144)', '(145)', '(146)', '(147)', '(148)', '(149)', '(15)', '(150)', '(151)', '(152)', '(153)', '(154)', '(155)', '(156)', '(157)', '(158)', '(159)', '(16)', '(160)', '(161)', '(162)', '(163)', '(164)', '(165)', '(166)', '(167)', '(168)', '(169)', '(17)', '(170)', '(171)', '(172)', '(173)', '(174)', '(175)', '(176)', '(177)', '(178)', '(179)', '(18)', '(180)', '(181)', '(182)', '(183)', '(184)', '(185)', '(186)', '(187)', '(188)', '(189)', '(19)', '(190)', '(191)', '(192)', '(193)', '(194)', '(195)', '(196)', '(197)', '(198)', '(199)', '(2)', '(20)', '(200)', '(201)', '(202)', '(203)', '(204)', '(205)', '(206)', '(207)', '(208)', '(209)', '(21)', '(210)', '(211)', '(212)', '(213)', '(214)', '(215)', '(216)', '(217)', '(218)', '(219)', '(22)', '(220)', '(221)', '(222)', '(223)', '(224)', '(225)', '(226)', '(227)', '(228)', '(229)', '(23)', '(230)', '(231)', '(232)', '(233)', '(234)', '(235)', '(236)', '(237)', '(238)', '(239)', '(24)', '(240)', '(241)', '(242)', '(243)', '(244)', '(245)', '(246)', '(247)', '(248)', '(249)', '(25)', '(250)', '(251)', '(252)', '(253)', '(254)', '(255)', '(256)', '(257)', '(258)', '(259)', '(26)', '(260)', '(261)', '(262)', '(263)', '(264)', '(265)', '(266)', '(267)', '(268)', '(269)', '(27)', '(270)', '(271)', '(272)', '(273)', '(274)', '(275)', '(276)', '(277)', '(278)', '(279)', '(28)', '(280)', '(281)', '(282)', '(283)', '(284)', '(285)', '(286)', '(287)', '(288)', '(289)', '(29)', '(290)', '(291)', '(292)', '(293)', '(294)', '(3)', '(30)', '(31)', '(32)', '(33)', '(34)', '(35)', '(36)', '(37)', '(38)', '(39)', '(4)', '(40)', '(41)', '(42)', '(43)', '(44)', '(45)', '(46)', '(47)', '(48)', '(49)', '(5)', '(50)', '(51)', '(52)', '(53)', '(54)', '(55)', '(56)', '(57)', '(58)', '(59)', '(6)', '(60)', '(61)', '(62)', '(63)', '(64)', '(65)', '(66)', '(67)', '(68)', '(69)', '(7)', '(70)', '(71)', '(72)', '(73)', '(74)', '(75)', '(76)', '(77)', '(78)', '(79)', '(8)', '(80)', '(81)', '(82)', '(83)', '(84)', '(85)', '(86)', '(87)', '(88)', '(89)', '(9)', '(90)', '(91)', '(92)', '(93)', '(94)', '(95)', '(96)', '(97)', '(98)', '(99)']
 True
 True
 ```
@@ -442,44 +476,11 @@ Because a plain edge and a single bond are both written `-`, decoding leaves
 `edge_type` unset for `-`, and the molecular layer reads a missing type as a
 single bond, the way an omitted SMILES bond does.
 
-## Coverage
-
-The notation and the default vocabulary were checked against the MoLFormer
-copies of PubChem and ZINC15: every molecule RDKit can parse is encoded,
-decoded and compared with RDKit's canonical SMILES. The report with element,
-charge, hydrogen-count and size statistics is generated into
-[docs/dataset_scan.md](docs/dataset_scan.md) by `scripts/aggregate_scan.py`.
-The table is from a stratified subset scanned with the final notation (every
-10th PubChem file chunk, every 50th ZINC15 chunk); the vocabulary ranges come
-from earlier full scans of both datasets.
-
-| | PubChem subset | ZINC15 subset |
-| --- | --- | --- |
-| molecules checked | 11,440,000 | 20,519,928 |
-| molecules RDKit cannot parse | 33 | 0 |
-| isotopes (then unsupported, now encoded) | 0 | 4 |
-| encode or decode failure | 0 | 0 |
-| round trip differs from RDKit's canonical SMILES | 8 | 0 |
-| atoms per molecule | max 660, 99.9% ≤ 139 | max 38, 99.9% ≤ 36 |
-| tokens per molecule | max 2,082, mean 85 | max 135, mean 81 |
-
-All 8 PubChem differences are RDKit artifacts: RDKit itself writes a different
-canonical SMILES for these molecules after its own parse/write cycle (the
-report classifies every recorded case and lists its SNACK string). Across the
-full datasets, the only other mismatch classes found were aromaticity
-perception that depends on atom order in a few fused ring systems and one
-conjugated hydrazone scaffold, both again RDKit's own behavior.
-
-The default vocabulary covers everything observed in the full datasets:
-charges from −4 to +8, written hydrogen counts up to 7 (`Re(H7)`, `P(H5)`,
-`I(H5)`), 891 atoms and a largest distance of 593. Any `max_nodes` between
-the molecule size you train on and 1024 works; the masks cost time
-proportional to the molecule, not to the vocabulary.
 
 ## Not supported
 
-- Atom map numbers and bond types other than single, double and triple
-  (dative, aromatic input is kekulized).
+- Atom map numbers and bond types other than single, double, triple and
+  aromatic (dative, for instance).
 - Axial chirality (allenes, atropisomers), square-planar/octahedral metal
   centers, enhanced stereo groups (and/or), and unknown ("wavy") stereo.
 - 3D coordinates, conformers, and tautomers.

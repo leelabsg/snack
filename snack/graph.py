@@ -22,10 +22,13 @@ DEFAULT_NODE_TOKEN = 'o'
 # for - and graph_to_mol reads a missing type as a single bond, as SMILES does.
 NODE_TYPE_STR = r'o|\*|[A-Z][a-z]?'
 DISTANCE_STR = r'[1-9][0-9]*'
-EDGE_TYPE_STR = r'[-=#]'
+EDGE_TYPE_STR = r'[-=#a]'
 ATTRIBUTE_STR = r'\([^()\r\n]+\)'
-EDGE_TYPES = ('-', '=', '#')
+# a is an aromatic bond, for callers who would rather not kekulize. A type
+# always follows a distance, so the a in Na1-C is sodium and never a bond.
+EDGE_TYPES = ('-', '=', '#', 'a')
 PLAIN_EDGE = '-'
+AROMATIC_EDGE = 'a'
 
 RE_NODE_TYPE = re.compile(NODE_TYPE_STR)
 RE_DISTANCE = re.compile(DISTANCE_STR)
