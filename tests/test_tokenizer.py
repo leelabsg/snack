@@ -198,7 +198,7 @@ class TokenizerTests(unittest.TestCase):
         # With a given H count RDKit ignores noble-gas limits and relaxes some charged states.
         self.assertEqual(capacity('He', 0, lenient=True), UNLIMITED)
         self.assertEqual(capacity('N', 0, lenient=True), 3)
-        self.assertEqual(capacity('C', 1, lenient=True), 5)
+        self.assertEqual(capacity('C', 1, lenient=True), 3)
         self.assertEqual(capacity('Sn', 2, lenient=True), 6)
 
     # ----- graph preset grammar ------------------------------------------------

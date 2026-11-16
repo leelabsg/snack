@@ -695,7 +695,12 @@ def relabel_nodes(graph: nx.Graph, order: list) -> nx.Graph:
 
 
 def _node_color(data, node_key):
-    return (data.get(node_key), data.get('hydrogens'), data.get('charge', 0) or 0)
+    return (data.get(node_key), data.get('isotope', 0),
+            data.get('hydrogens'), data.get('charge', 0) or 0)
+
+
+def _edge_color(data, edge_key):
+    return (data.get(edge_key), data.get('weight'))
 
 
 def count_automorphisms(graph: nx.Graph, node_key='node_type', edge_key='edge_type', *,
@@ -719,7 +724,7 @@ def count_automorphisms(graph: nx.Graph, node_key='node_type', edge_key='edge_ty
     for node, attributes in graph.nodes(data=True):
         colors[('node', _node_color(attributes, node_key))].add(rank[node])
     for index, (u, v, attributes) in enumerate(graph.edges(data=True), len(graph)):
-        colors[('edge', attributes.get(edge_key))].add(index)
+        colors[('edge', _edge_color(attributes, edge_key))].add(index)
         adjacency[index] = {rank[u], rank[v]}
         adjacency[rank[u]].add(index)
         adjacency[rank[v]].add(index)
@@ -751,7 +756,7 @@ def _count_stereo_automorphisms(graph, node_key, edge_key, limit):
         return _node_color(a, node_key) == _node_color(b, node_key) and ('chirality' in a) == ('chirality' in b)
 
     def edge_match(a, b):
-        return a.get(edge_key) == b.get(edge_key) and ('cis_trans' in a) == ('cis_trans' in b)
+        return _edge_color(a, edge_key) == _edge_color(b, edge_key) and ('cis_trans' in a) == ('cis_trans' in b)
 
     def preserves(mapping):
         for node, (ligands, sign) in chirality.items():

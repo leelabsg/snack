@@ -20,7 +20,7 @@ Neural Information Processing Systems (NeurIPS), 2026
 - Node type: Atom type (C, N, O, ...)
 - Edge type: Bond type (-, =, #, ...)
 - Attributes: Formal charge, hydrogen count, chirality, isotope, ...
-- Distance: Graph distance between connected atoms (1, 2, 3, ...)
+- Distance: Difference between the node indices of connected atoms (1, 2, 3, ...)
 
 🍿 **SNACK** encodes graphs as sequences of tokens in the following order:
 
