@@ -1,4 +1,4 @@
-# Sequential Notation of Adjacent Connectivity FrameworK (SNACK) for molecules
+# SNACK: A Sequential Notation Framework for Probabilistic Graph Generation
 __version__ = "1.0.0"
 
 from snack.dataset import load_dataset

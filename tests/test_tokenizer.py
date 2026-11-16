@@ -17,7 +17,7 @@ MOLECULES = ['C[C@H](N)C(=O)O', 'F/C=C/F', 'F/C=C\\F', '[CH2]C', 'C[N+](C)(C)C',
              'c1cc[nH]c1', '[Cu]I', 'O=[PH3]', 'C[S@](=O)CC', '[Fe+3]', 'C[Si](C)(C)C',
              '[H][H]', '[NH4+]', 'CS(C)(=O)=O', '[O][O]', 'O=[N+]([O-])c1ccccc1', 'F[B-](F)(F)F',
              'C[C@@H]1CC(Nc2cncc(-c3nncn3C)c2)C[C@@H](C)C1', 'C[C@H](O)/C=C/[C@@H](F)Cl', '[C]',
-             'CCCC[Sn](CCCC)(CCCC)c1nc2ccccc2nc1C', '[O-][n+]1ccccc1', 'C[CH-]C', '[BH4-]', 'F[Kr]F']
+             'CCCC[Sn](CCCC)(CCCC)c1nc2ccccc2nc1C', '[O-][n+]1ccccc1', 'C[CH-]C', '[BH4-]', 'F[Xe]F']
 
 
 class TokenizerTests(unittest.TestCase):
@@ -192,14 +192,14 @@ class TokenizerTests(unittest.TestCase):
         self.assertEqual(capacity('B', -1), 4)
         self.assertEqual(capacity('S'), 6)
         self.assertEqual(capacity('He'), 0)
-        self.assertIsNone(capacity('He', -1))
+        self.assertEqual(capacity('He', -1), UNLIMITED)
         self.assertEqual(capacity('Fe'), UNLIMITED)
         self.assertEqual(capacity('*'), UNLIMITED)
-        # With a given H count RDKit ignores noble-gas limits and relaxes some charged states.
-        self.assertEqual(capacity('He', 0, lenient=True), UNLIMITED)
+        # Explicit H counts still obey RDKit's valence limits.
+        self.assertEqual(capacity('He', 0, lenient=True), 0)
         self.assertEqual(capacity('N', 0, lenient=True), 3)
-        self.assertEqual(capacity('C', 1, lenient=True), 5)
-        self.assertEqual(capacity('Sn', 2, lenient=True), 6)
+        self.assertEqual(capacity('C', 1, lenient=True), 3)
+        self.assertEqual(capacity('Sn', 2, lenient=True), UNLIMITED)
 
     # ----- graph preset grammar ------------------------------------------------
     def test_shifted_masks_and_padding(self):
@@ -356,12 +356,13 @@ class TokenizerTests(unittest.TestCase):
                                    attributes=('charge', 'hydrogens', 'chirality', 'cis_trans'))
         after_c = self.attributes_allowed(tokenizer, 'C')
         self.assertEqual(after_c, {'(+)', '(+2)', '(+3)', '(+4)', '(+5)', '(+6)', '(+7)', '(+8)',
-                                   '(-)', '(-2)', '(-3)', '(-4)', '(H0)', '(H)', '(H2)', '(H3)', '(H4)',
+                                   '(-)', '(-2)', '(-3)', '(-4)', '(-5)', '(-6)', '(-7)', '(-8)',
+                                   '(H0)', '(H)', '(H2)', '(H3)', '(H4)',
                                    '(@)', '(@@)'})
         # Each attribute kind at most once, in order charge, hydrogens, chirality.
-        # RDKit allows up to five hydrogens on a C+ with a given H count.
+        # C+ accepts at most three hydrogens.
         self.assertEqual(self.attributes_allowed(tokenizer, 'C(+)'),
-                         {'(H0)', '(H)', '(H2)', '(H3)', '(H4)', '(H5)', '(@)', '(@@)'})
+                         {'(H0)', '(H)', '(H2)', '(H3)', '(@)', '(@@)'})
         self.assertEqual(self.attributes_allowed(tokenizer, 'C(+)(H3)'), {'(@)', '(@@)'})
         self.assertEqual(self.attributes_allowed(tokenizer, 'C(+)(H3)(@)'), set())
         self.assertIn('[eos]', self.allowed(tokenizer, 'C(+)(H3)(@)'))
@@ -375,13 +376,15 @@ class TokenizerTests(unittest.TestCase):
         self.assertEqual(snack.snack_to_smiles('C(+)(H3)'), '[CH3+]')
         fluorine = self.attributes_allowed(tokenizer, 'F')
         self.assertTrue({'(+)', '(-)', '(H)', '(H0)'} <= fluorine)
-        self.assertTrue({'(@)', '(@@)', '(H2)', '(-2)'}.isdisjoint(fluorine))
-        # Helium has no valence to spare unless its H count is given, which RDKit never limits.
+        self.assertTrue({'(@)', '(@@)', '(H2)'}.isdisjoint(fluorine))
+        self.assertIn('(-2)', fluorine)  # RDKit treats this charge state as unlimited.
+        # Neutral helium has zero valence even with an explicit H count.
         helium = self.attributes_allowed(tokenizer, 'He')
-        self.assertTrue({'(+)', '(-)', '(H0)', '(H8)'} <= helium)   # RDKit accepts [He-] with a given H count
+        self.assertTrue({'(+)', '(-)', '(H0)'} <= helium)
+        self.assertNotIn('(H8)', helium)
         self.assertNotIn('(@)', helium)
         # A complete node: only EOS or the next node's first edge may follow.
-        self.assertEqual(self.allowed(tokenizer, 'He(H0)'), {'1', '[eos]'})
+        self.assertEqual(self.allowed(tokenizer, 'He(H0)'), {'[eos]'})
         self.assertEqual(snack.snack_to_smiles('He(H0)'), '[He]')
 
     def test_cis_trans_only_after_double_bonds(self):
