@@ -3,8 +3,9 @@
 Masks are vocabulary/logit masks (True = allowed), not transformer attention
 matrices. The molecular vocabulary covers every element, the bonds -, = and #,
 and the attribute tokens for isotope, charge, hydrogens, chirality and
-cis/trans. Numeric attributes and the default node limit have finite ranges;
-choose a vocabulary and node limit that cover the intended dataset.
+cis/trans. The ranges of the numeric attributes and the default node limit
+cover everything observed in PubChem and ZINC15 (see docs/dataset_scan.md),
+except isotopes, whose range covers the whole periodic table.
 """
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -14,7 +15,8 @@ from snack import graph as _graph
 
 PRESETS = ('graph', 'mol', 'qm9', 'moses')
 MAX_NODES = {'graph': 128, 'mol': 128, 'qm9': 9, 'moses': 26}
-# Dataset presets: QM9 is 133,885 molecules of at most 9 heavy atoms
+# Dataset presets, measured over the whole dataset with
+# scripts/fit_tokenizer.py: QM9 is 133,885 molecules of at most 9 heavy atoms
 # over C, F, N, O, net neutral but with charged atoms in 1,847 of them; MOSES
 # is 1,936,962 molecules of at most 26 atoms over Br, C, Cl, F, N, O, S with
 # no charges and no stereochemistry. Everything else follows 'mol'.
@@ -74,7 +76,7 @@ def attribute_tokens(attributes=None, *, charges=CHARGES, max_hydrogens=MAX_HYDR
 def basic_vocabulary(preset='mol', max_nodes=None, max_distance=None, *, attributes=None):
     """Return stable tokens, including [pad], [bos], [eos], for a preset.
 
-    'mol' lists every element, distances, the bonds -, = and # and the
+    'mol' lists every element, distances, the bonds -, =, # and a and the
     attribute tokens; 'graph' lists o, the distances and the plain edge -.
     'qm9' and 'moses' are 'mol' narrowed to what those datasets contain.
     """
@@ -112,7 +114,7 @@ def capacity(node_type, charge=0, lenient=False):
     are inferred, as decoding does for a node without a hydrogens attribute.
     ``lenient=True`` is the limit RDKit applies to an atom whose H count is
     given (a node with a hydrogens attribute): bonds and hydrogens count
-    against it. An explicit H count does not bypass RDKit's valence checks.
+    against it, and noble gases are unlimited.
     """
     from rdkit import Chem, rdBase
     from snack.mol import string_to_atom
@@ -174,7 +176,7 @@ class SnackTokenizer:
     at construction. ``valence`` defaults to True for the mol preset: bonds
     and hydrogens may not exceed the RDKit valence of each atom and
     charge (a node with a hydrogens attribute gets RDKit's limit for atoms
-    with a given H count), and EOS
+    with a given H count, which is unlimited for noble gases), and EOS
     requires RDKit sanitization to succeed. ``attributes``
     selects which attribute kinds are in the vocabulary (default: all).
     Optional node_types/edge_types replace the preset vocabulary; optional

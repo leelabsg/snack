@@ -155,8 +155,9 @@ def _bare_atom(node_type, data):
 def _implicit_hydrogens(mol):
     """Per-atom H counts RDKit infers, or None where it rejects the valence instead.
 
-    Explicit hydrogen counts preserve radicals and unusual hydrogen states;
-    RDKit still checks valence when an explicit H count is present.
+    RDKit only applies its valence limits to atoms whose H count it infers;
+    an atom written with a hydrogens attribute (noble gases, odd metal
+    states) is accepted as given, so such atoms always need the attribute.
     """
     from rdkit import rdBase
     mol.UpdatePropertyCache(strict=False)
@@ -206,7 +207,7 @@ def mol_to_graph(mol, attributes=None):
     cis_trans to keep (default: all). Charges and isotopes are stored when set;
     a hydrogens count is stored only where decoding would infer a different
     count, which covers radicals ([CH2]C is C(H2)1-C). Atom maps and bonds
-    other than single, double, triple and aromatic are not supported and raise
+    other than single, double and triple are not supported and raise
     ValueError.
     """
     if mol is None:

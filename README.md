@@ -12,18 +12,17 @@ Neural Information Processing Systems (NeurIPS), 2026
 ---
 
 <p align="center">
-   <img src="https://raw.githubusercontent.com/leelabsg/snack/main/image/snack_fig.png" alt="SNACK encoding process" width="650px">
+   <img src="image/snack_fig.png" alt="SNACK encoding process" width="650px">
 </p>
 
 
-**SNACK** represents discrete graphs as compact strings using four basic elements. For molecular graphs:
-
+🍿 **SNACK** represents discrete graphs as compact strings using four basic elements. For example, in molecular graphs:
 - Node type: Atom type (C, N, O, ...)
 - Edge type: Bond type (-, =, #, ...)
 - Attributes: Formal charge, hydrogen count, chirality, isotope, ...
-- Distance: Difference between the node indices of connected atoms (1, 2, 3, ...)
+- Distance: Graph distance between connected atoms (1, 2, 3, ...)
 
-**SNACK** encodes graphs as sequences of tokens in the following order:
+🍿 **SNACK** encodes graphs as sequences of tokens in the following order:
 
 `Node type → (Node attributes) → Distance → Edge type → (Edge attributes) → Node type`
 
@@ -32,14 +31,13 @@ For example, **CH₂=NH₂⁺** is encoded as:
 ```python
 import snack as snk
 
-print(snk.smiles_to_snack('C=[NH2+]', ordering=None))
+snk.smiles_to_snack('C=[NH2+]')
 ```
 ```text
 C1=N(+)
 ```
 
 where:
-
 - **`C`** and **`N`**: Node types.
 - **`1`**: Distance between two nodes, calculated as the difference between their node indices.
 - **`=`**: Edge type (double bond).
@@ -49,52 +47,30 @@ where:
 Node and edge attributes are optional and included only when needed.
 
 
-`N(+)` can be split into separate tokens (`N` and `(+)`) or treated as a
-single token (`N(+)`). The paper uses the latter approach.
+> Note: N(+) can be split into separate tokens (N and (+)) or treated as a single token (N(+)). In the paper, we adopt the latter approach.
 
-Generic graphs use `o` for an untyped node and `-` for an untyped edge:
-
+General graphs are also supported by setting default node and edge types:
 ```python
 import snack as snk
 
 G = snk.snack_to_graph('o(color=blue)1-o(color=red)2-o')
-print(list(G.nodes(data=True)))
+G.nodes.data(True)
 ```
 ```text
-[(0, {'color': 'blue'}), (1, {'color': 'red'}), (2, {})]
+NodeDataView({0: {'color': 'blue'}, 1: {'color': 'red'}, 2: {}})
 ```
 
 
 ## Installation
 
-Requires Python 3.10 or later. `snack-graph` offers helper utilities to convert between:
+`snack-graph` offers helper utilities to convert between:
 
 - **SMILES / RDKit molecules** ↔ **SNACK strings**
 - **NetworkX graphs** ↔ **SNACK strings**
 
 ```bash
-python -m pip install --upgrade "snack-graph>=1,<2"
+pip install snack-graph
 ```
-
-The package is installed as `snack-graph` and imported as `snack`. Its runtime
-dependencies are `networkx`, `pynauty`, and `rdkit`; PyTorch and pandas are not
-required.
-
-### Upgrading from 0.x
-
-Version 1.0.0 changes the notation and tokenizer vocabulary. Strings and token
-IDs from 0.x are incompatible with 1.x. For example, `[C]1-[O]` becomes
-`C1-O`, and `v1_v` becomes `o1-o`. Re-encode original molecules or NetworkX
-graphs with 1.x, and rebuild tokenized datasets and model vocabularies.
-
-The `use_hydrogens`, `use_charge`, and `stereo` encoding options are replaced
-by `attributes`; supported molecular attributes are kept by default. To keep
-only charges and hydrogen counts, use `attributes=("charge", "hydrogens")`.
-The `zinc250k` and `guacamol` tokenizer presets are replaced by the general
-`"mol"` preset; `"qm9"`, `"moses"`, and `"graph"` are also available.
-
-To reproduce work that uses the old notation, install `snack-graph==0.1.0`
-in a separate environment.
 
 ## Notation
 
@@ -165,16 +141,12 @@ smiles: CC(=O)Oc1ccccc1C(=O)O
 
 ### 2) Charges, hydrogen counts and stereochemistry
 
-Supported molecular attributes are kept by default.
+Every attribute is kept by default, so decoding returns the input molecule.
 
 ```python
 import snack as snk
 
-examples = [
-    "C[C@H](N)C(=O)O", "F/C=C/F", "C[N+](C)(C)C", "[CH2]C",
-    "C[O]", "O=[PH3]", "[O-][n+]1ccccc1", "F[Xe]F",
-]
-for smiles in examples:
+for smiles in ["C[C@H](N)C(=O)O", "F/C=C/F", "C[N+](C)(C)C", "[CH2]C", "C[O]", "O=[PH3]", "[O-][n+]1ccccc1", "F[Kr]F"]:
     sn = snk.smiles_to_snack(smiles, ordering=None)
     print(f"{smiles:18} {sn:32} {snk.snack_to_smiles(sn)}")
 ```
@@ -187,14 +159,14 @@ C[N+](C)(C)C       C1-N(+)1-C2-C3-C                 C[N+](C)(C)C
 C[O]               C1-O(H0)                         C[O]
 O=[PH3]            O1=P(H3)                         O=[PH3]
 [O-][n+]1ccccc1    O(-)1-N(+)1=C1-C1=C1-C5-1=C      [O-][n+]1ccccc1
-F[Xe]F             F1-Xe1-F                         F[Xe]F
+F[Kr]F             F1-Kr(H0)1-F                     F[Kr]F
 ```
 
 Hydrogen counts are implied by the element, bonds and charge (RDKit's valence
 model), so `(H...)` appears only where that inference gives a different
 count: fewer hydrogens than inferred means a radical (`C(H2)`), more means a
-hypervalent atom (`P(H3)`). Explicit H counts still obey RDKit's valence
-checks; for example, RDKit rejects neutral `F[Kr]F`.
+hypervalent atom (`P(H3)`). It also appears where RDKit would reject the
+atom unless its H count is given, as in `Kr(H0)`.
 
 ### 3) Choosing which attributes to keep
 
@@ -234,8 +206,8 @@ for smiles in ["c1ccccc1", "Cc1ccc(O)cc1", "c1cc[nH]c1"]:
 ```
 
 ```text
-C1aC1aC1aC1aC5a1aC           C1-C1=C1-C1=C5=1-C           c1ccccc1
-C1-C1aC1aC1aC1-O2aC6a1aC     C1-C1-C1=C1-C1-O2=C6=1-C     Cc1ccc(O)cc1
+C1aC1aC1aC1aC5a1aC           C1=C1-C1=C1-C5-1=C           c1ccccc1
+C1-C1aC1aC1aC1-O2aC6a1aC     C1-C1=C1-C1=C1-O2-C6-1=C     Cc1ccc(O)cc1
 C1aC1aC1aN(H)4a1aC           C1-C1=C1-N4=1-C              c1cc[nH]c1
 ```
 
@@ -325,7 +297,8 @@ counts up to 8, chirality and cis/trans). `encode()` adds `[bos]` and
 `attributes` to keep only some attribute kinds. Isotope labels are rare, so
 dropping that kind removes 294 of the 575 tokens.
 
-Besides `"mol"` and `"graph"`, there are dataset-specific presets:
+Besides `"mol"` and `"graph"` there are presets fitted to a dataset, each
+measured over the whole of it with `scripts/fit_tokenizer.py`:
 
 | Preset | Tokens | Node types | Node limit | Attributes |
 | --- | ---: | --- | ---: | --- |
@@ -361,7 +334,8 @@ Masks enforce the grammar, connectivity, the node limit and RDKit valence:
 bonds and hydrogens may not exceed what the element and charge allow, and
 `[eos]` is offered only when RDKit sanitizes the molecule.
 An atom written with too many bonds can only be continued by a charge that
-fixes it. Hydrogen counts and bond orders must fit RDKit's valence limits.
+fixes it. A node whose hydrogen count is written gets RDKit's limit for atoms
+with a given H count, which is what makes noble-gas compounds reachable.
 
 ```python
 import snack as snk
@@ -373,7 +347,7 @@ def allowed(text):
 
 print(allowed("O1"))
 print("[eos]" in allowed("C1-C1-C3-2-1=N(+)"))
-print("[eos]" in allowed("F1-Xe1-F"))
+print("[eos]" in allowed("F1-Kr(H0)1-F"))
 ```
 
 ```text
@@ -443,16 +417,13 @@ N1=O2-N1=O
 O=NN=O
 ```
 
-Every completed sequence ending in `[eos]` with valence checks enabled
-decodes to a sanitized RDKit molecule. If no tokens are allowed, backtrack
-or restart generation.
+Every sequence produced this way decodes to a sanitized RDKit molecule.
 Generated stereo marks may be unnecessary; filter with `is_canonical_snack()`.
 
 ### 12) Automorphisms and generic graphs
 
 `count_automorphisms()` treats node types, attributes and bond types as
-colors, including isotopes, charges, hydrogen counts and edge weights;
-`stereo=True` additionally respects chirality and cis/trans (meso
+colors; `stereo=True` additionally respects chirality and cis/trans (meso
 2,3-butanediol has 1 instead of 2).
 
 ```python
@@ -470,7 +441,7 @@ Generic graphs work the same way: `o` is a node with no type and `-` a plain
 edge, so `o1-o1-o` is a three-node path, and `SnackTokenizer("graph")` masks
 them. `load_dataset()` returns the bundled `community_small`, `ego`,
 `ego_small`, `enzymes`, `grid`, `grid_small`, `lobster`, `planar` and `sbm`
-splits (see [dataset details](https://github.com/leelabsg/snack/blob/main/snack/data/README.md)).
+splits (see [dataset details](snack/data/README.md)).
 
 Any other node or edge data is written as one `(key=value)` token per entry,
 sorted by name, after the compact attributes. Values may be integers, real
