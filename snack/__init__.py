@@ -1,5 +1,5 @@
 # Sequential Notation of Adjacent Connectivity FrameworK (SNACK) for molecules
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 from snack.dataset import load_dataset
 from snack.mol import (
