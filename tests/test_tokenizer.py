@@ -17,7 +17,7 @@ MOLECULES = ['C[C@H](N)C(=O)O', 'F/C=C/F', 'F/C=C\\F', '[CH2]C', 'C[N+](C)(C)C',
              'c1cc[nH]c1', '[Cu]I', 'O=[PH3]', 'C[S@](=O)CC', '[Fe+3]', 'C[Si](C)(C)C',
              '[H][H]', '[NH4+]', 'CS(C)(=O)=O', '[O][O]', 'O=[N+]([O-])c1ccccc1', 'F[B-](F)(F)F',
              'C[C@@H]1CC(Nc2cncc(-c3nncn3C)c2)C[C@@H](C)C1', 'C[C@H](O)/C=C/[C@@H](F)Cl', '[C]',
-             'CCCC[Sn](CCCC)(CCCC)c1nc2ccccc2nc1C', '[O-][n+]1ccccc1', 'C[CH-]C', '[BH4-]', 'F[Kr]F']
+             'CCCC[Sn](CCCC)(CCCC)c1nc2ccccc2nc1C', '[O-][n+]1ccccc1', 'C[CH-]C', '[BH4-]', 'F[Xe]F']
 
 
 class TokenizerTests(unittest.TestCase):
@@ -35,6 +35,11 @@ class TokenizerTests(unittest.TestCase):
 
     def attributes_allowed(self, tokenizer, text):
         return {token for token in self.allowed(tokenizer, text) if token.startswith('(')}
+
+    @staticmethod
+    def rdkit_accepts(smiles):
+        with rdBase.BlockLogs():
+            return Chem.MolFromSmiles(smiles) is not None
 
     # ----- vocabulary ----------------------------------------------------------
     def test_default_vocabulary_is_general(self):
@@ -192,14 +197,17 @@ class TokenizerTests(unittest.TestCase):
         self.assertEqual(capacity('B', -1), 4)
         self.assertEqual(capacity('S'), 6)
         self.assertEqual(capacity('He'), 0)
-        self.assertIsNone(capacity('He', -1))
         self.assertEqual(capacity('Fe'), UNLIMITED)
         self.assertEqual(capacity('*'), UNLIMITED)
-        # With a given H count RDKit ignores noble-gas limits and relaxes some charged states.
-        self.assertEqual(capacity('He', 0, lenient=True), UNLIMITED)
-        self.assertEqual(capacity('N', 0, lenient=True), 3)
-        self.assertEqual(capacity('C', 1, lenient=True), 3)
-        self.assertEqual(capacity('Sn', 2, lenient=True), 6)
+        for element, charge, counts in (
+                ('He', 0, (0, 1, 8)), ('N', 0, (3, 4)),
+                ('C', 1, (3, 4, 5, 6)), ('Sn', 2, (2, 3, 6, 7, 12))):
+            limit = capacity(element, charge, lenient=True)
+            for hydrogens in counts:
+                smiles = f'[{element}H{hydrogens}{charge:+}]'
+                with self.subTest(smiles=smiles):
+                    self.assertEqual(limit is not None and hydrogens <= limit,
+                                     self.rdkit_accepts(smiles))
 
     # ----- graph preset grammar ------------------------------------------------
     def test_shifted_masks_and_padding(self):
@@ -355,13 +363,14 @@ class TokenizerTests(unittest.TestCase):
         tokenizer = SnackTokenizer(max_nodes=4,
                                    attributes=('charge', 'hydrogens', 'chirality', 'cis_trans'))
         after_c = self.attributes_allowed(tokenizer, 'C')
-        self.assertEqual(after_c, {'(+)', '(+2)', '(+3)', '(+4)', '(+5)', '(+6)', '(+7)', '(+8)',
-                                   '(-)', '(-2)', '(-3)', '(-4)', '(H0)', '(H)', '(H2)', '(H3)', '(H4)',
-                                   '(@)', '(@@)'})
+        charges = {snack.attribute_token('charge', charge) for charge in range(-8, 9)
+                   if charge and self.rdkit_accepts(f'[CH0{charge:+}]')}
+        self.assertEqual(after_c, charges | {'(H0)', '(H)', '(H2)', '(H3)', '(H4)', '(@)', '(@@)'})
         # Each attribute kind at most once, in order charge, hydrogens, chirality.
-        # RDKit allows up to five hydrogens on a C+ with a given H count.
+        cation_hydrogens = {snack.attribute_token('hydrogens', count) for count in range(9)
+                            if self.rdkit_accepts(f'[CH{count}+]')}
         self.assertEqual(self.attributes_allowed(tokenizer, 'C(+)'),
-                         {'(H0)', '(H)', '(H2)', '(H3)', '(H4)', '(H5)', '(@)', '(@@)'})
+                         cation_hydrogens | {'(@)', '(@@)'})
         self.assertEqual(self.attributes_allowed(tokenizer, 'C(+)(H3)'), {'(@)', '(@@)'})
         self.assertEqual(self.attributes_allowed(tokenizer, 'C(+)(H3)(@)'), set())
         self.assertIn('[eos]', self.allowed(tokenizer, 'C(+)(H3)(@)'))
@@ -375,13 +384,17 @@ class TokenizerTests(unittest.TestCase):
         self.assertEqual(snack.snack_to_smiles('C(+)(H3)'), '[CH3+]')
         fluorine = self.attributes_allowed(tokenizer, 'F')
         self.assertTrue({'(+)', '(-)', '(H)', '(H0)'} <= fluorine)
-        self.assertTrue({'(@)', '(@@)', '(H2)', '(-2)'}.isdisjoint(fluorine))
-        # Helium has no valence to spare unless its H count is given, which RDKit never limits.
+        self.assertTrue({'(@)', '(@@)', '(H2)'}.isdisjoint(fluorine))
+        self.assertEqual('(-2)' in fluorine, self.rdkit_accepts('[FH0-2]'))
         helium = self.attributes_allowed(tokenizer, 'He')
-        self.assertTrue({'(+)', '(-)', '(H0)', '(H8)'} <= helium)   # RDKit accepts [He-] with a given H count
+        self.assertTrue({'(+)', '(-)', '(H0)'} <= helium)
+        helium_hydrogens = {snack.attribute_token('hydrogens', count) for count in range(9)
+                            if self.rdkit_accepts(f'[HeH{count}]')}
+        self.assertEqual({token for token in helium if token.startswith('(H')}, helium_hydrogens)
         self.assertNotIn('(@)', helium)
         # A complete node: only EOS or the next node's first edge may follow.
-        self.assertEqual(self.allowed(tokenizer, 'He(H0)'), {'1', '[eos]'})
+        after_helium = {'[eos]'} | ({'1'} if self.rdkit_accepts('C[He]') else set())
+        self.assertEqual(self.allowed(tokenizer, 'He(H0)'), after_helium)
         self.assertEqual(snack.snack_to_smiles('He(H0)'), '[He]')
 
     def test_cis_trans_only_after_double_bonds(self):
